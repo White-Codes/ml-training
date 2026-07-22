@@ -6,7 +6,9 @@ on:
 jobs:
   run-training:
     runs-on: ubuntu-latest
-    
+    permissions:
+      contents: write # Allows pushing commits back to main
+
     steps:
     - name: Clone Codebase
       uses: actions/checkout@v4
@@ -31,3 +33,18 @@ jobs:
     - name: Run Headless 5.5-Hour Optimization
       run: |
         timeout 5.5h python3 train.py || echo "Session window complete. Transferring states..."
+
+    - name: Commit and Push Updated Artifacts
+      run: |
+        git config --global user.name "github-actions[bot]"
+        git config --global user.email "github-actions[bot]@users.noreply.github.com"
+        git add xgb_rl_artifacts/ || true
+        git commit -m "Auto-save training checkpoint [skip ci]" || echo "No changes to commit"
+        git push origin main || true
+
+    - name: Auto-Trigger Next 5.5-Hour Session
+      if: always()
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        gh workflow run "Uncapped Continuous ML Training" --ref main

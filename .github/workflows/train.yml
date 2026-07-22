@@ -31,10 +31,13 @@ jobs:
           rl-weights-
 
     - name: Run Headless 5.5-Hour Optimization
+      env:
+        PYTHONUNBUFFERED: "1"
       run: |
-        timeout 5.5h python3 train.py || echo "Session window complete. Transferring states..."
+        timeout 5.5h python3 train.py || true
 
     - name: Commit and Push Updated Artifacts
+      if: always()
       run: |
         git config --global user.name "github-actions[bot]"
         git config --global user.email "github-actions[bot]@users.noreply.github.com"

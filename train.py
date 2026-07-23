@@ -655,33 +655,31 @@ class ONNXExporter(_BaseExporter):
 gc.collect()
 print(f"Starting GitHub Actions Job | RAM: {ram()}\n")
 
-# Cache directory for workflow relay
-cache_dir = os.path.join(os.getcwd(), "training_cache")
+# Align folder with .github/workflows/train.yml cache & git steps
+cache_dir = os.path.join(os.getcwd(), "xgb_rl_artifacts")
 os.makedirs(cache_dir, exist_ok=True)
-print(f"Cache dir: {cache_dir}")
+print(f"Artifacts output dir: {cache_dir}")
 
 cfg = SystemConfig(
-    HISTORICAL_BARS        = 50000,
-    OPTUNA_N_TRIALS        = 40,
-    OPTUNA_CV_SPLITS       = 5,
-    TRAIN_WINDOW           = 8000,
-    RETRAIN_INTERVAL       = 800,
-    MIN_TRAIN_SAMPLES      = 1000,
-    BATCH_SIZE             = 256,
-    MIN_BUFFER_SIZE        = 1000,
+    HISTORICAL_BARS         = 50000,
+    OPTUNA_N_TRIALS         = 40,
+    OPTUNA_CV_SPLITS        = 5,
+    TRAIN_WINDOW            = 8000,
+    RETRAIN_INTERVAL        = 800,
+    MIN_TRAIN_SAMPLES       = 1000,
+    BATCH_SIZE              = 256,
+    MIN_BUFFER_SIZE         = 1000,
     REPLAY_BUFFER_CAPACITY = 50000,
-    N_ENSEMBLE_MODELS      = 3,
-    MAX_FEATURES_SELECTED  = 30,
-    CORRELATION_THRESHOLD  = 0.90,
-    NOISE_INJECTION_LEVEL  = 0.005,
-    FEATURE_DROPOUT_RATE   = 0.05,
-    OUTPUT_DIR             = cache_dir,
-    TRADING_PAIR           = "EURUSD",
+    N_ENSEMBLE_MODELS       = 3,
+    MAX_FEATURES_SELECTED   = 30,
+    CORRELATION_THRESHOLD   = 0.90,
+    NOISE_INJECTION_LEVEL   = 0.005,
+    FEATURE_DROPOUT_RATE    = 0.05,
+    OUTPUT_DIR              = cache_dir,
+    TRADING_PAIR            = "EURUSD",
 
-    # Updated XGB base — tree_method
-    # overridden by GPU_PARAMS at runtime
     XGB_BASE = {
-        "n_estimators":  800,
+        "n_estimators":   800,
         "learning_rate": 0.03,
         "reg_alpha":     0.5,
         "reg_lambda":    1.0,
@@ -697,24 +695,16 @@ cfg = SystemConfig(
     MAX_POSITION_SIZE  = 0.15,
 )
 
-# Run full pipeline
+# Run pipeline
 metrics = train_and_export(
     cfg      = cfg,
     source   = "csv",
     filepath = "EURUSD_H1.csv"
 )
 
-# Bundle for workflow upload
-archive_path = os.path.join(cache_dir, "xgb_rl_artifacts")
-shutil.make_archive(
-    archive_path,
-    "zip",
-    cache_dir)
-
-print(f"\nArchive created: {archive_path}.zip")
-
+# Verify saved artifacts for GitHub Action commit
 files = os.listdir(cache_dir)
-print(f"\nTotal files in cache: {len(files)}")
+print(f"\nTotal files in {cache_dir}: {len(files)}")
 for f in sorted(files):
     print(f"  {f}")
 print("\nDone! Workflow handoff ready.")

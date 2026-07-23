@@ -8,10 +8,13 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write # Allows pushing commits back to main
+      actions: write  # Allows triggering subsequent workflow runs
 
     steps:
     - name: Clone Codebase
       uses: actions/checkout@v4
+      with:
+        token: ${{ secrets.GITHUB_TOKEN }}
 
     - name: Initialize Python Runtime
       uses: actions/setup-python@v5
@@ -50,4 +53,4 @@ jobs:
       env:
         GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       run: |
-        gh workflow run "Uncapped Continuous ML Training" --ref main
+        gh workflow run "Uncapped Continuous ML Training" --ref main || true

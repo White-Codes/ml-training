@@ -49,6 +49,7 @@ jobs:
         run: |
           timeout 5.5h python3 train.py || true
 
+      # ── Always save current progress before exit ──
       - name: Commit and Push Artifacts
         if: always()
         run: |
@@ -62,8 +63,9 @@ jobs:
             "Auto-save checkpoint [skip ci]"
           git push origin main || true
 
+      # ── Only auto-trigger if job succeeded (stops loop on cancellation/failure) ──
       - name: Auto-Trigger Next Session
-        if: always()
+        if: success()
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |

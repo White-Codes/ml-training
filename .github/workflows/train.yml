@@ -1,56 +1,72 @@
 name: Uncapped Continuous ML Training
 
 on:
-  workflow_dispatch: # Gives you the manual 'Start' button in the browser
+  workflow_dispatch:
 
 jobs:
   run-training:
     runs-on: ubuntu-latest
     permissions:
-      contents: write # Allows pushing commits back to main
-      actions: write  # Allows triggering subsequent workflow runs
+      contents: write
+      actions: write
 
     steps:
-    - name: Clone Codebase
-      uses: actions/checkout@v4
-      with:
-        token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Clone Codebase
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
 
-    - name: Initialize Python Runtime
-      uses: actions/setup-python@v5
-      with:
-        python-version: '3.10'
+      - name: Initialize Python Runtime
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
 
-    - name: Install Libraries
-      run: |
-        pip install xgboost shap optuna scikit-learn pandas numpy matplotlib seaborn scipy joblib tqdm skl2onnx onnxruntime onnx psutil
+      - name: Install Libraries
+        run: |
+          pip install xgboost shap optuna \
+            scikit-learn pandas numpy \
+            matplotlib seaborn scipy \
+            joblib tqdm skl2onnx \
+            onnxruntime onnx psutil
 
-    - name: Restore Relay Cache Matrix
-      uses: actions/cache@v4
-      with:
-        path: xgb_rl_artifacts/
-        key: rl-weights-latest
-        restore-keys: |
-          rl-weights-
+      # ── Restore artifacts from previous session ──
+      - name: Restore Relay Cache
+        uses: actions/cache@v4
+        with:
+          path: xgb_rl_artifacts/
+          key: rl-weights-latest
+          restore-keys: |
+            rl-weights-
 
-    - name: Run Headless 5.5-Hour Optimization
-      env:
-        PYTHONUNBUFFERED: "1"
-      run: |
-        timeout 5.5h python3 train.py || true
+      # ── Also restore from git in case cache missed ──
+      - name: Pull Latest Artifacts from Git
+        run: |
+          git pull origin main || true
 
-    - name: Commit and Push Updated Artifacts
-      if: always()
-      run: |
-        git config --global user.name "github-actions[bot]"
-        git config --global user.email "github-actions[bot]@users.noreply.github.com"
-        git add -A xgb_rl_artifacts/ || true
-        git commit -m "Auto-save training checkpoint [skip ci]" || echo "No changes to commit"
-        git push origin main || true
+      - name: Run 5.5-Hour Training Session
+        env:
+          PYTHONUNBUFFERED: "1"
+        run: |
+          timeout 5.5h python3 train.py || true
 
-    - name: Auto-Trigger Next 5.5-Hour Session
-      if: always()
-      env:
-        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      run: |
-        gh workflow run "Uncapped Continuous ML Training" --ref main || true
+      - name: Commit and Push Artifacts
+        if: always()
+        run: |
+          git config --global user.name \
+            "github-actions[bot]"
+          git config --global user.email \
+            "github-actions[bot]@users.noreply.github.com"
+          git add -A xgb_rl_artifacts/ || true
+          git diff --staged --quiet || \
+            git commit -m \
+            "Auto-save checkpoint [skip ci]"
+          git push origin main || true
+
+      - name: Auto-Trigger Next Session
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh workflow run \
+            "Uncapped Continuous ML Training" \
+            --ref main || true

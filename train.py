@@ -21,11 +21,28 @@ from trainer import (
     SumTree, train_and_export
 )
 
-from skl2onnx import convert_sklearn
+# ── ONNX imports with XGBoost converter registration ──
+from skl2onnx import convert_sklearn, update_registered_converter
 from skl2onnx.common.data_types import FloatTensorType
+from skl2onnx.common.shape_calculator import (
+    calculate_linear_regressor_output_shapes
+)
+from onnxmltools.convert.xgboost.operator_converters.XGBoost import (
+    convert_xgboost
+)
+
+# Register XGBRegressor so skl2onnx can convert it
+update_registered_converter(
+    XGBRegressor,
+    "XGBoostXGBRegressor",
+    calculate_linear_regressor_output_shapes,
+    convert_xgboost,
+)
+
 import onnxruntime as ort
 
-# ── GPU Detection ─────────────────────────────────────
+
+# ── GPU Detection ──────────────────────────────────────
 def get_xgb_gpu_params():
     X = np.random.rand(100, 5).astype(np.float32)
     y = np.random.randint(0, 2, 100)
@@ -38,7 +55,7 @@ def get_xgb_gpu_params():
         m.fit(X, y)
         print("✔ Using device=cuda")
         return {"device": "cuda", "tree_method": "hist"}
-    except:
+    except Exception:
         pass
     try:
         m = XGBClassifier(
@@ -48,10 +65,11 @@ def get_xgb_gpu_params():
         m.fit(X, y)
         print("✔ Using tree_method=gpu_hist")
         return {"device": None, "tree_method": "gpu_hist"}
-    except:
+    except Exception:
         pass
     print("⚠ Using CPU")
     return {"device": None, "tree_method": "hist"}
+
 
 GPU_PARAMS = get_xgb_gpu_params()
 print(f"GPU params: {GPU_PARAMS}\n")
@@ -70,35 +88,56 @@ def ram():
 def save_session_state(agent, port, reward, wf,
                        selected, scaler_params,
                        start_idx, all_results,
-                       output_dir):
-    """Save training state for next session to resume."""
+                       output_dir,
+                       training_completed=False):
+    """
+    Save training state for next session to resume.
+
+    training_completed=True means the full dataset was
+    consumed and the next session should restart from 0.
+    """
     state_path = os.path.join(
         output_dir, "session_state.joblib")
     try:
+        # ── KEY FIX: If training finished the whole
+        # dataset, reset start_idx to the beginning
+        # so the next session does not instantly skip. ──
+        if training_completed:
+            save_idx = max(
+                1000, 200)   # fresh start next session
+            print(f"[RELAY] Training completed full "
+                  f"dataset — next session will restart "
+                  f"from step {save_idx}")
+        else:
+            save_idx = start_idx
+
         state = {
-            "epsilon":      agent.epsilon,
-            "step":         agent.step,
-            "fitted":       agent.fitted,
-            "ew":           agent.ew,
-            "buf_size":     agent.buf.size,
-            "equity":       port.equity,
-            "cash":         port.cash,
-            "pos":          port.pos,
-            "trades":       port.trades,
-            "wins":         port.wins,
-            "gross_p":      port.gross_p,
-            "gross_l":      port.gross_l,
-            "reward_hist":  reward.hist[-200:],
-            "wf_last":      wf.last,
-            "wf_cnt":       wf.cnt,
-            "start_idx":    start_idx,
-            "selected":     selected,
-            "scaler_params":scaler_params,
-            "n_results":    len(all_results),
+            "epsilon":            agent.epsilon,
+            "step":               agent.step,
+            "fitted":             agent.fitted,
+            "ew":                 agent.ew,
+            "buf_size":           agent.buf.size,
+            "equity":             port.equity,
+            "cash":               port.cash,
+            "pos":                port.pos,
+            "trades":             port.trades,
+            "wins":               port.wins,
+            "gross_p":            port.gross_p,
+            "gross_l":            port.gross_l,
+            "reward_hist":        reward.hist[-200:],
+            "wf_last":            wf.last,
+            "wf_cnt":             wf.cnt,
+            "start_idx":          save_idx,
+            "selected":           selected,
+            "scaler_params":      scaler_params,
+            "n_results":          len(all_results),
+            # Track whether to run export next session
+            "training_completed": training_completed,
         }
         joblib.dump(state, state_path)
         print(f"[RELAY] Session state saved → "
-              f"{state_path}")
+              f"{state_path} "
+              f"(next start_idx={save_idx})")
     except Exception as e:
         print(f"[WARN] Could not save state: {e}")
 
@@ -114,9 +153,10 @@ def load_session_state(output_dir):
     try:
         state = joblib.load(state_path)
         print(f"[RELAY] Loaded session state: "
-              f"step={state.get('step',0)} "
-              f"epsilon={state.get('epsilon',1.0):.4f} "
-              f"trades={state.get('trades',0)}")
+              f"step={state.get('step', 0)} "
+              f"epsilon={state.get('epsilon', 1.0):.4f} "
+              f"trades={state.get('trades', 0)} "
+              f"start_idx={state.get('start_idx', 0)}")
         return state
     except Exception as e:
         print(f"[WARN] Could not load state: {e}")
@@ -130,20 +170,19 @@ def save_agent_models(agent, output_dir):
     try:
         for a in range(agent.n_a):
             for mi in range(agent.n_m):
-                # Q1
-                fi1 = agent.q1[a][mi]["fi"]
+                fi1  = agent.q1[a][mi]["fi"]
                 mdl1 = agent.q1[a][mi]["model"]
                 path1 = os.path.join(
                     models_dir,
                     f"q1_a{a}_m{mi}.json")
                 mdl1.save_model(path1)
-                # Q2
+
                 mdl2 = agent.q2[a][mi]["model"]
                 path2 = os.path.join(
                     models_dir,
                     f"q2_a{a}_m{mi}.json")
                 mdl2.save_model(path2)
-                # Feature indices
+
                 if fi1 is not None:
                     fi_path = os.path.join(
                         models_dir,
@@ -189,13 +228,34 @@ def load_agent_models(agent, output_dir):
 
         if loaded > 0:
             agent.fitted = True
-            print(f"[RELAY] Loaded {loaded} "
-                  f"model files from {models_dir}/")
+            print(f"[RELAY] Loaded {loaded} model files "
+                  f"from {models_dir}/")
             return True
         return False
     except Exception as e:
         print(f"[WARN] Model load failed: {e}")
         return False
+
+
+# ════════════════════════════════════════════════════════
+# TRAINING PROGRESS FLAG
+# Written to disk so train.yml can detect whether
+# meaningful work was done before triggering next run.
+# ════════════════════════════════════════════════════════
+
+def write_progress_flag(output_dir, steps_run: int):
+    """
+    Write a small JSON file reporting how many training
+    steps were executed this session.  The workflow reads
+    this to decide whether to auto-trigger the next run.
+    """
+    flag_path = os.path.join(
+        output_dir, "session_progress.json")
+    payload = {"steps_run": steps_run}
+    with open(flag_path, "w") as fh:
+        json.dump(payload, fh)
+    print(f"[FLAG] session_progress.json → "
+          f"steps_run={steps_run}")
 
 
 # ════════════════════════════════════════════════════════
@@ -233,7 +293,8 @@ class FeatureSelector:
 
         rem  = list(X.columns)
         n    = min(8000, len(X))
-        sidx = np.random.choice(len(X), n, replace=False)
+        sidx = np.random.choice(len(X), n,
+                                 replace=False)
         Xa   = X.iloc[sidx].values.astype(np.float32)
         ya   = y.iloc[sidx].values
         del X
@@ -262,7 +323,7 @@ class FeatureSelector:
                 Xa, ya,
                 random_state=42,
                 n_neighbors=5)
-        except:
+        except Exception:
             mi = xgb_imp.copy()
         del Xa, ya
         gc.collect()
@@ -287,7 +348,6 @@ class FeatureSelector:
 
 # ════════════════════════════════════════════════════════
 # OVERRIDE 2: FeatureEngine
-# Full feature set matching v4.03 EA ComputeRaw()
 # ════════════════════════════════════════════════════════
 class FeatureEngine:
     EPS = 1e-10
@@ -300,7 +360,8 @@ class FeatureEngine:
         d = s.diff()
         g = d.clip(lower=0).rolling(p).mean()
         l = (-d.clip(upper=0)).rolling(p).mean()
-        return 100 - 100 / (1 + g / (l + FeatureEngine.EPS))
+        return 100 - 100 / (
+            1 + g / (l + FeatureEngine.EPS))
 
     @staticmethod
     def _macd(s, f=12, sl=26, sg=9):
@@ -323,18 +384,22 @@ class FeatureEngine:
     def _stoch(h, l, c, kp=14, dp=3):
         ll = l.rolling(kp).min()
         hh = h.rolling(kp).max()
-        k  = 100 * (c - ll) / (hh - ll + FeatureEngine.EPS)
+        k  = 100 * (c - ll) / (
+            hh - ll + FeatureEngine.EPS)
         return k, k.rolling(dp).mean()
 
     @staticmethod
     def _obv(c, v):
-        return (np.sign(c.diff()).fillna(0) * v).cumsum()
+        return (
+            np.sign(c.diff()).fillna(0) * v
+        ).cumsum()
 
     @staticmethod
     def _williams_r(h, l, c, p=14):
         hh = h.rolling(p).max()
         ll = l.rolling(p).min()
-        return -100 * (hh - c) / (hh - ll + FeatureEngine.EPS)
+        return -100 * (hh - c) / (
+            hh - ll + FeatureEngine.EPS)
 
     @staticmethod
     def _cci(h, l, c, p=20):
@@ -343,7 +408,8 @@ class FeatureEngine:
         md = tp.rolling(p).apply(
             lambda x: np.mean(np.abs(x - x.mean())),
             raw=True)
-        return (tp - ma) / (0.015 * md + FeatureEngine.EPS)
+        return (tp - ma) / (
+            0.015 * md + FeatureEngine.EPS)
 
     def build(self, data):
         print(f"  RAM at feature build: {ram()}")
@@ -355,21 +421,23 @@ class FeatureEngine:
         v   = df["volume"]
         ret = df["returns"]
 
-        # Price / MA
         for p in [10, 20, 50, 100]:
             sma = c.rolling(p).mean()
-            df[f"close_sma_{p}"] = c / (sma + eps) - 1
+            df[f"close_sma_{p}"] = (
+                c / (sma + eps) - 1)
         for p in [10, 20, 50]:
             ema = c.ewm(span=p, adjust=False).mean()
-            df[f"close_ema_{p}"] = c / (ema + eps) - 1
+            df[f"close_ema_{p}"] = (
+                c / (ema + eps) - 1)
 
         ema10 = c.ewm(span=10, adjust=False).mean()
         ema20 = c.ewm(span=20, adjust=False).mean()
         ema50 = c.ewm(span=50, adjust=False).mean()
-        df["ema10_20_cross"] = ema10 / (ema20 + eps) - 1
-        df["ema20_50_cross"] = ema20 / (ema50 + eps) - 1
+        df["ema10_20_cross"] = (
+            ema10 / (ema20 + eps) - 1)
+        df["ema20_50_cross"] = (
+            ema20 / (ema50 + eps) - 1)
 
-        # Momentum
         for p in [7, 14, 21]:
             df[f"rsi_{p}"] = self._rsi(c, p)
         df["rsi_14_slope"]   = df["rsi_14"].diff(3)
@@ -384,41 +452,44 @@ class FeatureEngine:
             np.sign(df["macd_hist"].shift(1)))
         df["williams_r"] = self._williams_r(h, l, c)
         df["cci"]        = self._cci(h, l, c)
-        df["stoch_k"], df["stoch_d"] = self._stoch(h, l, c)
-        df["stoch_cross"] = df["stoch_k"] - df["stoch_d"]
+        df["stoch_k"], df["stoch_d"] = (
+            self._stoch(h, l, c))
+        df["stoch_cross"] = (
+            df["stoch_k"] - df["stoch_d"])
 
         for p in [1, 5, 10, 20]:
             df[f"ret_{p}"] = c.pct_change(p)
 
-        # Volatility
         for w in [10, 20, 60]:
             df[f"vol_{w}"] = ret.rolling(w).std()
-        df["vol_ratio"] = df["vol_20"] / (df["vol_60"] + eps)
+        df["vol_ratio"] = (
+            df["vol_20"] / (df["vol_60"] + eps))
         df["atr_14"]    = self._atr(h, l, c, 14)
         df["atr_ratio"] = df["atr_14"] / (c + eps)
-        df["atr_pct"]   = df["atr_14"].rolling(100).rank(
-            pct=True)
+        df["atr_pct"]   = (
+            df["atr_14"].rolling(100).rank(pct=True))
 
         bm = c.rolling(20).mean()
         bs = c.rolling(20).std()
-        df["bb_pos"]     = (c - (bm - 2*bs)) / (4*bs + eps)
+        df["bb_pos"]     = (
+            (c - (bm - 2*bs)) / (4*bs + eps))
         df["bb_width"]   = 4 * bs / (bm + eps)
         df["bb_squeeze"] = (
             df["bb_width"] <
             df["bb_width"].rolling(50).mean()
         ).astype(float)
 
-        # Volume
         vsma = v.rolling(20).mean()
         df["vol_ratio_20"] = v / (vsma + eps)
         obv = self._obv(c, v)
         df["obv_norm"]  = obv / (obv.abs() + 1)
         df["obv_slope"] = obv.pct_change(5)
 
-        # Microstructure
         spread = (h - l).clip(lower=eps)
         df["spread_pct"] = spread / (c + eps)
-        df["body"] = (c - df["open"]).abs() / (spread + eps)
+        df["body"] = (
+            (c - df["open"]).abs() /
+            (spread + eps))
         top = pd.concat(
             [df["open"], c], axis=1).max(axis=1)
         bot = pd.concat(
@@ -437,7 +508,6 @@ class FeatureEngine:
             (df["body"] > 0.6)
         ).astype(float)
 
-        # Statistical
         rm = c.rolling(20).mean()
         rs = c.rolling(20).std()
         df["zscore_20"]      = (c - rm) / (rs + eps)
@@ -448,7 +518,6 @@ class FeatureEngine:
             df[f"skew_{w}"] = ret.rolling(w).skew()
             df[f"kurt_{w}"] = ret.rolling(w).kurt()
 
-        # Support / Resistance
         for p in [20, 50]:
             df[f"high_{p}"]      = h.rolling(p).max()
             df[f"low_{p}"]       = l.rolling(p).min()
@@ -457,15 +526,17 @@ class FeatureEngine:
             df[f"dist_low_{p}"]  = (
                 c - df[f"low_{p}"]) / (c + eps)
 
-        # ADX
         dm_pos = (h - h.shift(1)).clip(lower=0)
         dm_neg = (l.shift(1) - l).clip(lower=0)
         tr14   = df["atr_14"]
         df["adx_pos"] = (
-            dm_pos.rolling(14).mean() / (tr14 + eps))
+            dm_pos.rolling(14).mean() /
+            (tr14 + eps))
         df["adx_neg"] = (
-            dm_neg.rolling(14).mean() / (tr14 + eps))
-        df["adx"] = (df["adx_pos"] - df["adx_neg"]).abs()
+            dm_neg.rolling(14).mean() /
+            (tr14 + eps))
+        df["adx"] = (
+            df["adx_pos"] - df["adx_neg"]).abs()
 
         df.replace([np.inf, -np.inf], 0, inplace=True)
         df.dropna(inplace=True)
@@ -483,14 +554,12 @@ class FeatureEngine:
 
 # ════════════════════════════════════════════════════════
 # OVERRIDE 3: HPOptimizer
-# Persists Optuna study to SQLite for session resume
 # ════════════════════════════════════════════════════════
 class HPOptimizer:
     def __init__(self, cfg):
         self.cfg = cfg
 
     def optimize(self, X, y, storage_dir=None):
-        # SQLite persistence — survives across sessions
         if storage_dir:
             db_path = os.path.join(
                 storage_dir, "optuna_study.db")
@@ -535,14 +604,16 @@ class HPOptimizer:
             for fi, (tri, tei) in enumerate(folds):
                 m = XGBClassifier(**params)
                 try:
-                    m.fit(X[tri], y[tri],
-                          eval_set=[(X[tei], y[tei])],
-                          verbose=False)
+                    m.fit(
+                        X[tri], y[tri],
+                        eval_set=[(X[tei], y[tei])],
+                        verbose=False)
                     auc = roc_auc_score(
                         y[tei],
-                        m.predict_proba(X[tei])[:, 1])
+                        m.predict_proba(
+                            X[tei])[:, 1])
                     scores.append(auc)
-                except:
+                except Exception:
                     scores.append(0.5)
                 trial.report(np.mean(scores), fi)
                 if trial.should_prune():
@@ -550,7 +621,6 @@ class HPOptimizer:
 
             return float(np.mean(scores))
 
-        # load_if_exists=True is the key resume mechanism
         study = optuna.create_study(
             study_name="xgb_rl_optimization",
             direction="maximize",
@@ -559,9 +629,9 @@ class HPOptimizer:
             sampler=optuna.samplers.TPESampler(seed=42),
             pruner=optuna.pruners.HyperbandPruner())
 
-        existing = len(study.trials)
-        remaining = max(0,
-            self.cfg.OPTUNA_N_TRIALS - existing)
+        existing  = len(study.trials)
+        remaining = max(
+            0, self.cfg.OPTUNA_N_TRIALS - existing)
         print(f"  [Optuna] Existing trials: {existing} "
               f"| Running: {remaining} more")
 
@@ -598,6 +668,7 @@ class HPOptimizer:
 # ════════════════════════════════════════════════════════
 _BaseAgent = EnsembleDoubleQAgent
 
+
 class EnsembleDoubleQAgent(_BaseAgent):
     def _make(self, i: int) -> XGBRegressor:
         p = {
@@ -617,6 +688,7 @@ _BaseExporter = __import__(
     'trainer',
     fromlist=['ONNXExporter']).ONNXExporter
 
+
 class ONNXExporter(_BaseExporter):
 
     def _export_one(self, mdl, net_name: str,
@@ -629,13 +701,19 @@ class ONNXExporter(_BaseExporter):
             ("input",
              FloatTensorType([1, in_dim]))
         ]
+
+        # convert_sklearn now works for XGBRegressor
+        # because we registered the converter at the
+        # top of this file with update_registered_converter
         try:
             onnx_model = convert_sklearn(
                 mdl,
                 initial_types=init_types,
                 target_opset=15,
-                options={type(mdl): {"nocopy": True}})
-        except:
+                options={
+                    type(mdl): {"nocopy": True}
+                })
+        except Exception:
             onnx_model = convert_sklearn(
                 mdl,
                 initial_types=init_types,
@@ -695,7 +773,8 @@ class ONNXExporter(_BaseExporter):
                             mdl, net_name,
                             a, mi, in_dim)
                         exported.append(
-                            f"{net_name}_a{a}_m{mi}.onnx")
+                            f"{net_name}_a{a}"
+                            f"_m{mi}.onnx")
                     except Exception as e:
                         print(f"  ✘ {net_name} "
                               f"a={a} m={mi}: {e}")
@@ -711,7 +790,8 @@ class ONNXExporter(_BaseExporter):
                 fi  = agent.q1[a][mi]["fi"]
                 key = f"a{a}_m{mi}"
                 fi_map[key] = (
-                    fi.tolist() if fi is not None
+                    fi.tolist()
+                    if fi is not None
                     else list(range(state_dim)))
 
         with open(os.path.join(
@@ -735,22 +815,30 @@ class ONNXExporter(_BaseExporter):
         with open(os.path.join(
                 self.out, "config.json"), "w") as f:
             json.dump({
-                "N_ACTIONS":           agent.n_a,
-                "N_ENSEMBLE_MODELS":   agent.n_m,
-                "GAMMA":               agent.gamma,
-                "STATE_DIM":           state_dim,
-                "N_MARKET_FEATURES":   len(selected),
-                "N_PORTFOLIO_FEATURES":9,
-                "N_REGIME_FEATURES":   8,
-                "SELECTED_FEATURES":   selected,
-                "CONFIDENCE_THRESHOLD":agent.conf_thr,
+                "N_ACTIONS":
+                    agent.n_a,
+                "N_ENSEMBLE_MODELS":
+                    agent.n_m,
+                "GAMMA":
+                    agent.gamma,
+                "STATE_DIM":
+                    state_dim,
+                "N_MARKET_FEATURES":
+                    len(selected),
+                "N_PORTFOLIO_FEATURES": 9,
+                "N_REGIME_FEATURES":    8,
+                "SELECTED_FEATURES":
+                    selected,
+                "CONFIDENCE_THRESHOLD":
+                    agent.conf_thr,
             }, f, indent=2)
         with open(os.path.join(
                 self.out,
                 "training_report.json"), "w") as f:
             json.dump(
                 {k: float(v)
-                 if isinstance(v, (float, np.floating))
+                 if isinstance(
+                     v, (float, np.floating))
                  else v
                  for k, v in report.items()},
                 f, indent=2)
@@ -765,12 +853,11 @@ class ONNXExporter(_BaseExporter):
 gc.collect()
 print(f"Starting GitHub Actions Job | RAM: {ram()}\n")
 
-# Output dir aligned with train.yml cache path
-cache_dir = os.path.join(os.getcwd(), "xgb_rl_artifacts")
+cache_dir = os.path.join(
+    os.getcwd(), "xgb_rl_artifacts")
 os.makedirs(cache_dir, exist_ok=True)
 print(f"Artifacts dir: {cache_dir}")
 
-# Check for previous session
 prev_state = load_session_state(cache_dir)
 
 cfg = SystemConfig(
@@ -809,8 +896,8 @@ cfg = SystemConfig(
 # ── Load data & features ──────────────────────────────
 print("Phase 1: Data")
 from trainer import DataIngestion
-data = DataIngestion.load("csv", "EURUSD_H1.csv",
-                          cfg.HISTORICAL_BARS)
+data = DataIngestion.load(
+    "csv", "EURUSD_H1.csv", cfg.HISTORICAL_BARS)
 print(f"  {len(data):,} bars loaded\n")
 
 print("Phase 2: Features")
@@ -819,7 +906,6 @@ feat_data = fe.build(data)
 print(f"  {feat_data.shape[1]} columns\n")
 
 # ── Feature selection ─────────────────────────────────
-# Reuse selected features from previous session if available
 if (prev_state and
         "selected" in prev_state and
         len(prev_state["selected"]) > 0):
@@ -832,14 +918,13 @@ else:
     sel    = FeatureSelector(cfg)
     target = (feat_data["returns"].shift(-1) > 0
               ).astype(int).iloc[:-1]
-    feat_sub  = feat_data.iloc[:-1].copy()
-    selected  = sel.select(
+    feat_sub = feat_data.iloc[:-1].copy()
+    selected = sel.select(
         feat_sub, target, cfg.MAX_FEATURES_SELECTED)
-    cut       = int(0.6 * len(feat_sub))
+    cut = int(0.6 * len(feat_sub))
     scaler_params = build_scaler_params(
         feat_sub[selected].iloc[:cut], selected)
 
-    # ── Optuna with SQLite persistence ────────────────
     print("\nPhase 4: Hyperparameter Optimization")
     Xopt = (feat_sub[selected].iloc[:cut]
             .fillna(0).values.astype(np.float32))
@@ -852,9 +937,11 @@ else:
 
 # ── Initialize components ─────────────────────────────
 print("Phase 5: Initialize Agent")
-from trainer import (PortfolioManager, RiskManager,
-                     RewardFunction, WalkForward,
-                     StateBuilder, PerfMonitor)
+from trainer import (
+    PortfolioManager, RiskManager,
+    RewardFunction, WalkForward,
+    StateBuilder, PerfMonitor
+)
 
 agent  = EnsembleDoubleQAgent(cfg)
 port   = PortfolioManager(cfg)
@@ -869,58 +956,73 @@ if prev_state:
     agent.epsilon = prev_state.get("epsilon", 1.0)
     agent.step    = prev_state.get("step", 0)
     agent.ew      = prev_state.get(
-        "ew", np.ones(cfg.N_ENSEMBLE_MODELS) /
-              cfg.N_ENSEMBLE_MODELS)
-    port.equity   = prev_state.get("equity",
-                                    cfg.INITIAL_CAPITAL)
-    port.cash     = prev_state.get("cash",
-                                    cfg.INITIAL_CAPITAL)
-    port.trades   = prev_state.get("trades", 0)
-    port.wins     = prev_state.get("wins", 0)
-    port.gross_p  = prev_state.get("gross_p", 0.0)
-    port.gross_l  = prev_state.get("gross_l", 0.0)
-    reward.hist   = prev_state.get("reward_hist", [])
-    wf.last       = prev_state.get("wf_last", 0)
-    wf.cnt        = prev_state.get("wf_cnt", 0)
+        "ew",
+        np.ones(cfg.N_ENSEMBLE_MODELS) /
+        cfg.N_ENSEMBLE_MODELS)
+    port.equity  = prev_state.get(
+        "equity", cfg.INITIAL_CAPITAL)
+    port.cash    = prev_state.get(
+        "cash", cfg.INITIAL_CAPITAL)
+    port.trades  = prev_state.get("trades", 0)
+    port.wins    = prev_state.get("wins", 0)
+    port.gross_p = prev_state.get("gross_p", 0.0)
+    port.gross_l = prev_state.get("gross_l", 0.0)
+    reward.hist  = prev_state.get("reward_hist", [])
+    wf.last      = prev_state.get("wf_last", 0)
+    wf.cnt       = prev_state.get("wf_cnt", 0)
 
-    # Load XGBoost model weights
     if load_agent_models(agent, cache_dir):
         print("[RELAY] ✔ Agent models restored")
 
-# Determine start index
-start_idx = prev_state.get(
-    "start_idx",
-    max(cfg.MIN_TRAIN_SAMPLES, 200)
-) if prev_state else max(cfg.MIN_TRAIN_SAMPLES, 200)
+# ── Determine start index ─────────────────────────────
+# KEY FIX: clamp start_idx so it can never equal or
+# exceed end_idx, preventing the instant-finish loop.
+_default_start = max(cfg.MIN_TRAIN_SAMPLES, 200)
+start_idx = (
+    prev_state.get("start_idx", _default_start)
+    if prev_state else _default_start
+)
 
-# State dim
+end_idx = len(feat_data) - 1
+
+# Guard: if a stale checkpoint put us at or past the
+# end of the data, reset cleanly to the beginning.
+if start_idx >= end_idx:
+    print(
+        f"[RELAY] ⚠ start_idx ({start_idx}) >= "
+        f"end_idx ({end_idx}) — resetting to "
+        f"{_default_start} for a fresh pass"
+    )
+    start_idx = _default_start
+
 test_pi    = port.info(
     float(feat_data["close"].iloc[200]))
 test_state = sb.build(
     feat_data, 200, selected, test_pi)
 state_dim  = len(test_state)
-print(f"  State dim: {state_dim}")
-print(f"  Resume from step: {start_idx}\n")
+print(f"  State dim:  {state_dim}")
+print(f"  Start step: {start_idx}")
+print(f"  End step:   {end_idx}\n")
 
 # ── Walk-forward training loop ────────────────────────
 print("Phase 6: Walk-Forward Training")
 from tqdm import tqdm
-import signal, time
+import time
 
-end_idx     = len(feat_data) - 1
-selected    = [f for f in selected
-               if f in feat_data.columns]
-all_results = []
-train_log   = []
+selected = [f for f in selected
+            if f in feat_data.columns]
+all_results  = []
+train_log    = []
+steps_run    = 0           # track real work done
 
-# 5-hour time limit with 25-min buffer for save
-SESSION_LIMIT = 5 * 3600 + 5 * 60
+SESSION_LIMIT = 5 * 3600 + 5 * 60   # 5 h 5 min
 session_start = time.time()
+timed_out     = False
+dataset_done  = False
 
 for t in tqdm(range(start_idx, end_idx),
               desc="Training", unit="step"):
 
-    # Time check — save state before timeout
     elapsed = time.time() - session_start
     if elapsed > SESSION_LIMIT:
         print(f"\n[RELAY] Time limit reached at "
@@ -928,8 +1030,10 @@ for t in tqdm(range(start_idx, end_idx),
         save_session_state(
             agent, port, reward, wf,
             selected, scaler_params,
-            t, all_results, cache_dir)
+            t, all_results, cache_dir,
+            training_completed=False)
         save_agent_models(agent, cache_dir)
+        timed_out = True
         break
 
     if wf.should_retrain(t, feat_data):
@@ -938,24 +1042,27 @@ for t in tqdm(range(start_idx, end_idx),
             reward.reset()
         if len(all_results) > 100:
             rs = np.array(
-                [r["state"] for r in all_results[-100:]])
+                [r["state"]
+                 for r in all_results[-100:]])
             rt = np.array(
-                [r["reward"] for r in all_results[-100:]])
+                [r["reward"]
+                 for r in all_results[-100:]])
             agent.update_ew(rs, rt)
-            # Save checkpoint at each retrain
             save_agent_models(agent, cache_dir)
 
     pi    = port.info(
         float(feat_data["close"].iloc[t]),
         feat_data["timestamp"].iloc[t])
-    state = sb.build(feat_data, t, selected, pi)
+    state = sb.build(
+        feat_data, t, selected, pi)
     raw_a = agent.select(state, training=True)
 
     row = feat_data.iloc[t]
     mkt = {
         "vol_20": float(row.get("vol_20", 0.02)),
         "vol_60": float(row.get("vol_60", 0.02)),
-        "date":   str(feat_data["timestamp"].iloc[t])[:10]
+        "date":   str(
+            feat_data["timestamp"].iloc[t])[:10]
     }
     val_a = risk.validate(raw_a, pi, mkt)
     conf  = agent.confidence(state)
@@ -971,7 +1078,8 @@ for t in tqdm(range(start_idx, end_idx),
     wf.record(rwd)
 
     if t < end_idx - 1:
-        ns   = sb.build(feat_data, t+1, selected, upi)
+        ns   = sb.build(
+            feat_data, t+1, selected, upi)
         done = False
     else:
         ns = state; done = True
@@ -990,6 +1098,7 @@ for t in tqdm(range(start_idx, end_idx),
         "reward": rwd,
         "state":  state,
     })
+    steps_run += 1
 
     if (res["equity"] <
             cfg.INITIAL_CAPITAL *
@@ -997,16 +1106,30 @@ for t in tqdm(range(start_idx, end_idx),
         print(f"\nEmergency stop at step {t}")
         break
 
+else:
+    # Loop finished without a break → full dataset done
+    dataset_done = True
+
+# ── Write how many steps were run so the workflow
+# can decide whether to trigger the next session ──────
+write_progress_flag(cache_dir, steps_run)
+print(f"\n[FLAG] Steps run this session: {steps_run}")
+
 # ── Final session save ────────────────────────────────
-save_session_state(
-    agent, port, reward, wf,
-    selected, scaler_params,
-    end_idx, all_results, cache_dir)
-save_agent_models(agent, cache_dir)
+if not timed_out:
+    # Dataset was consumed (or emergency stop)
+    # Reset checkpoint so next run starts fresh
+    save_session_state(
+        agent, port, reward, wf,
+        selected, scaler_params,
+        end_idx, all_results, cache_dir,
+        training_completed=dataset_done)
+    save_agent_models(agent, cache_dir)
 
 # ── Evaluation & ONNX export ──────────────────────────
 print("\nPhase 7: Evaluation")
-metrics = perf.evaluate(port.eq_curve, port.trade_log)
+metrics = perf.evaluate(
+    port.eq_curve, port.trade_log)
 
 print("Phase 8: ONNX Export")
 exporter = ONNXExporter(cfg)

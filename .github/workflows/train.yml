@@ -23,11 +23,11 @@ jobs:
 
       - name: Install Libraries
         run: |
-          pip install xgboost shap optuna \
-            scikit-learn pandas numpy \
-            matplotlib seaborn scipy \
-            joblib tqdm skl2onnx \
-            onnxruntime onnx psutil
+          pip install xgboost shap optuna        \
+            scikit-learn pandas numpy            \
+            matplotlib seaborn scipy             \
+            joblib tqdm skl2onnx                 \
+            onnxruntime onnx psutil onnxmltools
 
       # ── Restore artifacts from previous session ──
       - name: Restore Relay Cache
@@ -38,7 +38,7 @@ jobs:
           restore-keys: |
             rl-weights-
 
-      # ── Also restore from git in case cache missed ──
+      # ── Pull latest checkpoints committed to git ──
       - name: Pull Latest Artifacts from Git
         run: |
           git pull origin main || true
@@ -49,7 +49,7 @@ jobs:
         run: |
           timeout 5.5h python3 train.py || true
 
-      # ── Always save current progress before exit ──
+      # ── Always commit progress before exit ────────
       - name: Commit and Push Artifacts
         if: always()
         run: |
@@ -63,12 +63,37 @@ jobs:
             "Auto-save checkpoint [skip ci]"
           git push origin main || true
 
-      # ── Only auto-trigger if job succeeded (stops loop on cancellation/failure) ──
+      # ── Only re-trigger when real training happened ──
+      # Reads session_progress.json written by train.py.
+      # If steps_run == 0 the loop did nothing useful,
+      # so we stop rather than spin forever.
+      - name: Check Training Progress
+        id: check_progress
+        if: always()
+        run: |
+          STEPS=0
+          if [ -f xgb_rl_artifacts/session_progress.json ]; then
+            STEPS=$(python3 -c "
+          import json
+          with open('xgb_rl_artifacts/session_progress.json') as f:
+              print(json.load(f).get('steps_run', 0))
+          ")
+          fi
+          echo "steps_run=${STEPS}" >> "$GITHUB_OUTPUT"
+          echo "Steps run this session: ${STEPS}"
+
       - name: Auto-Trigger Next Session
-        if: success()
+        # Only fire if the job succeeded AND real work
+        # was done (steps_run > 100 is a safe threshold)
+        if: >
+          success() &&
+          steps_run > 100
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          steps_run: ${{ steps.check_progress.outputs.steps_run }}
         run: |
+          echo "Triggering next session \
+            (steps_run=${steps_run})"
           gh workflow run \
             "Uncapped Continuous ML Training" \
             --ref main || true

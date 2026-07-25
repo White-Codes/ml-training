@@ -41,6 +41,12 @@ update_registered_converter(
 
 import onnxruntime as ort
 
+# ── FIX 1: Explicit opset dict that pins ai.onnx.ml=3 ──
+# onnxmltools defaults to ai.onnx.ml opset 5 which the
+# current skl2onnx/onnx stack does not support.
+# Pinning to 3 resolves the domain version mismatch.
+TARGET_OPSET = {"": 15, "ai.onnx.ml": 3}
+
 
 # ── GPU Detection ──────────────────────────────────────
 def get_xgb_gpu_params():
@@ -92,21 +98,16 @@ def save_session_state(agent, port, reward, wf,
                        training_completed=False):
     """
     Save training state for next session to resume.
-
-    training_completed=True means the full dataset was
-    consumed and the next session should restart from 0.
+    training_completed=True resets start_idx so the
+    next session does not instantly skip the dataset.
     """
     state_path = os.path.join(
         output_dir, "session_state.joblib")
     try:
-        # ── KEY FIX: If training finished the whole
-        # dataset, reset start_idx to the beginning
-        # so the next session does not instantly skip. ──
         if training_completed:
-            save_idx = max(
-                1000, 200)   # fresh start next session
+            save_idx = max(1000, 200)
             print(f"[RELAY] Training completed full "
-                  f"dataset — next session will restart "
+                  f"dataset — next session restarts "
                   f"from step {save_idx}")
         else:
             save_idx = start_idx
@@ -131,7 +132,6 @@ def save_session_state(agent, port, reward, wf,
             "selected":           selected,
             "scaler_params":      scaler_params,
             "n_results":          len(all_results),
-            # Track whether to run export next session
             "training_completed": training_completed,
         }
         joblib.dump(state, state_path)
@@ -164,34 +164,59 @@ def load_session_state(output_dir):
 
 
 def save_agent_models(agent, output_dir):
-    """Save XGBoost model files for resume."""
+    """
+    Save XGBoost model files for resume.
+
+    FIX 2: Individual model saves are now wrapped in a
+    try/except per model so that an unfitted model
+    (which raises 'need to call fit or load_model')
+    only skips that one file instead of aborting the
+    entire save and printing a top-level warning.
+    """
     models_dir = os.path.join(output_dir, "agent_models")
     os.makedirs(models_dir, exist_ok=True)
-    try:
-        for a in range(agent.n_a):
-            for mi in range(agent.n_m):
-                fi1  = agent.q1[a][mi]["fi"]
-                mdl1 = agent.q1[a][mi]["model"]
+    saved   = 0
+    skipped = 0
+
+    for a in range(agent.n_a):
+        for mi in range(agent.n_m):
+            # ── Q1 ───────────────────────────────────
+            try:
+                mdl1  = agent.q1[a][mi]["model"]
                 path1 = os.path.join(
                     models_dir,
                     f"q1_a{a}_m{mi}.json")
                 mdl1.save_model(path1)
+                saved += 1
+            except Exception:
+                # Model not yet fitted — skip silently
+                skipped += 1
 
-                mdl2 = agent.q2[a][mi]["model"]
+            # ── Q2 ───────────────────────────────────
+            try:
+                mdl2  = agent.q2[a][mi]["model"]
                 path2 = os.path.join(
                     models_dir,
                     f"q2_a{a}_m{mi}.json")
                 mdl2.save_model(path2)
+                saved += 1
+            except Exception:
+                skipped += 1
 
-                if fi1 is not None:
+            # ── Feature indices ───────────────────────
+            fi1 = agent.q1[a][mi]["fi"]
+            if fi1 is not None:
+                try:
                     fi_path = os.path.join(
                         models_dir,
                         f"fi_a{a}_m{mi}.npy")
                     np.save(fi_path, fi1)
-        print(f"[RELAY] Agent models saved to "
-              f"{models_dir}/")
-    except Exception as e:
-        print(f"[WARN] Model save failed: {e}")
+                except Exception:
+                    pass
+
+    print(f"[RELAY] Agent models saved to "
+          f"{models_dir}/ "
+          f"(saved={saved}, skipped={skipped})")
 
 
 def load_agent_models(agent, output_dir):
@@ -239,15 +264,12 @@ def load_agent_models(agent, output_dir):
 
 # ════════════════════════════════════════════════════════
 # TRAINING PROGRESS FLAG
-# Written to disk so train.yml can detect whether
-# meaningful work was done before triggering next run.
 # ════════════════════════════════════════════════════════
 
 def write_progress_flag(output_dir, steps_run: int):
     """
-    Write a small JSON file reporting how many training
-    steps were executed this session.  The workflow reads
-    this to decide whether to auto-trigger the next run.
+    Write session_progress.json so train.yml can check
+    whether enough real work happened before re-triggering.
     """
     flag_path = os.path.join(
         output_dir, "session_progress.json")
@@ -683,6 +705,9 @@ class EnsembleDoubleQAgent(_BaseAgent):
 
 # ════════════════════════════════════════════════════════
 # OVERRIDE 5: ONNXExporter — Static [1, n] shape
+# FIX 1 applied here: TARGET_OPSET passed to
+# convert_sklearn so ai.onnx.ml is pinned to opset 3
+# instead of the default 5 that the stack rejects.
 # ════════════════════════════════════════════════════════
 _BaseExporter = __import__(
     'trainer',
@@ -702,23 +727,24 @@ class ONNXExporter(_BaseExporter):
              FloatTensorType([1, in_dim]))
         ]
 
-        # convert_sklearn now works for XGBRegressor
-        # because we registered the converter at the
-        # top of this file with update_registered_converter
+        # ── FIX 1: pass TARGET_OPSET so the ai.onnx.ml
+        # domain is capped at version 3, not 5. ─────────
         try:
             onnx_model = convert_sklearn(
                 mdl,
                 initial_types=init_types,
-                target_opset=15,
+                target_opset=TARGET_OPSET,
                 options={
                     type(mdl): {"nocopy": True}
                 })
         except Exception:
+            # Fallback: drop options kwarg, keep opset fix
             onnx_model = convert_sklearn(
                 mdl,
                 initial_types=init_types,
-                target_opset=15)
+                target_opset=TARGET_OPSET)
 
+        # Force static shape [1, in_dim] on input
         graph = onnx_model.graph
         inp   = graph.input[0]
         inp.type.tensor_type.shape.ClearField("dim")
@@ -727,6 +753,7 @@ class ONNXExporter(_BaseExporter):
         d1 = inp.type.tensor_type.shape.dim.add()
         d1.dim_value = in_dim
 
+        # Force static shape [1, 1] on output
         out  = graph.output[0]
         out.type.tensor_type.shape.ClearField("dim")
         od0 = out.type.tensor_type.shape.dim.add()
@@ -742,6 +769,7 @@ class ONNXExporter(_BaseExporter):
         with open(fpath, "wb") as f:
             f.write(onnx_model.SerializeToString())
 
+        # Quick validation with a zero tensor
         sess    = ort.InferenceSession(fpath)
         dummy   = np.zeros(
             (1, in_dim), dtype=np.float32)
@@ -778,11 +806,15 @@ class ONNXExporter(_BaseExporter):
                     except Exception as e:
                         print(f"  ✘ {net_name} "
                               f"a={a} m={mi}: {e}")
-                        mdl.save_model(
-                            os.path.join(
-                                self.out,
-                                f"{net_name}_a{a}"
-                                f"_m{mi}.json"))
+                        # Fallback to raw JSON weights
+                        try:
+                            mdl.save_model(
+                                os.path.join(
+                                    self.out,
+                                    f"{net_name}_a{a}"
+                                    f"_m{mi}.json"))
+                        except Exception:
+                            pass  # unfitted, skip
 
         fi_map = {}
         for a in range(agent.n_a):
@@ -975,8 +1007,6 @@ if prev_state:
         print("[RELAY] ✔ Agent models restored")
 
 # ── Determine start index ─────────────────────────────
-# KEY FIX: clamp start_idx so it can never equal or
-# exceed end_idx, preventing the instant-finish loop.
 _default_start = max(cfg.MIN_TRAIN_SAMPLES, 200)
 start_idx = (
     prev_state.get("start_idx", _default_start)
@@ -985,8 +1015,7 @@ start_idx = (
 
 end_idx = len(feat_data) - 1
 
-# Guard: if a stale checkpoint put us at or past the
-# end of the data, reset cleanly to the beginning.
+# Guard: stale checkpoint past end of data → reset
 if start_idx >= end_idx:
     print(
         f"[RELAY] ⚠ start_idx ({start_idx}) >= "
@@ -1013,9 +1042,9 @@ selected = [f for f in selected
             if f in feat_data.columns]
 all_results  = []
 train_log    = []
-steps_run    = 0           # track real work done
+steps_run    = 0
 
-SESSION_LIMIT = 5 * 3600 + 5 * 60   # 5 h 5 min
+SESSION_LIMIT = 5 * 3600 + 5 * 60
 session_start = time.time()
 timed_out     = False
 dataset_done  = False
@@ -1107,18 +1136,14 @@ for t in tqdm(range(start_idx, end_idx),
         break
 
 else:
-    # Loop finished without a break → full dataset done
     dataset_done = True
 
-# ── Write how many steps were run so the workflow
-# can decide whether to trigger the next session ──────
+# ── Progress flag for workflow gate ──────────────────
 write_progress_flag(cache_dir, steps_run)
 print(f"\n[FLAG] Steps run this session: {steps_run}")
 
 # ── Final session save ────────────────────────────────
 if not timed_out:
-    # Dataset was consumed (or emergency stop)
-    # Reset checkpoint so next run starts fresh
     save_session_state(
         agent, port, reward, wf,
         selected, scaler_params,

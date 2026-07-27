@@ -81,7 +81,7 @@ class SystemConfig:
     # defaulting to Hold almost every step. 0.35 allows the
     # agent to act on moderate conviction signals and
     # dramatically increases trade frequency.
-    CONFIDENCE_THRESHOLD: float = 0.35
+    CONFIDENCE_THRESHOLD: float = 0.50
 
     N_ENSEMBLE_MODELS: int = 7
     ENSEMBLE_CONFIGS: List[dict] = field(default_factory=lambda: [
@@ -135,7 +135,7 @@ class SystemConfig:
     # a 1.5:1 R:R ratio — only needs 41% win rate for
     # Profit Factor > 1.30.
     ATR_SL_MULT:           float = 1.0   # Stop  = 1.0 × ATR14
-    ATR_TP_MULT:           float = 1.5   # Target = 1.5 × ATR14
+    ATR_TP_MULT:           float = 3.0   # Target = 1.5 × ATR14
     # Keep percentage fallback for when ATR is unavailable
     STOP_LOSS_PCT:         float = 0.02
     TAKE_PROFIT_PCT:       float = 0.06

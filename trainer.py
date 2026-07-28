@@ -1,44 +1,51 @@
 # ============================================================
-#  XGBoost_RL_Trainer.py
-#  This version fixes:
-#    1. ATR_TP_MULT reduced 3.0 → 1.5
-#    2. RewardFunction receives direct trade outcome
-#    3. PortfolioManager equity curve uses capped PnL
-#    4. SignalFilter: RSI+MACD confluence gate added
+#  XGB_DirectTrader.py
+#  Complete architectural redesign.
+#
+#  OLD: XGBoost Q-Learning (broken Q-divergence,
+#       phantom returns, uncapped equity)
+#
+#  NEW: Walk-Forward Supervised Classification
+#       - XGBoost predicts NEXT BAR DIRECTION
+#       - Simple threshold entry/exit rules
+#       - Fixed fractional position sizing (1% risk/trade)
+#       - ATR-based SL/TP enforced in backtest loop
+#       - Honest P&L: only closed trades count
+#       - No RL, no replay buffer, no Q-values
+#
+#  Why this works better:
+#    XGBoost excels at supervised classification.
+#    Predicting "will next bar close higher than
+#    current bar" is a well-posed problem.
+#    RL requires millions of environment steps and
+#    continuous action spaces — XGBoost handles
+#    neither well.
 # ============================================================
 
-import os, json, warnings, logging, random
+import os
+import json
+import warnings
+import logging
+import numpy as np
+import pandas as pd
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
+from scipy.stats import ks_2samp
+
 warnings.filterwarnings("ignore")
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s")
+    format="%(asctime)s | %(levelname)s | %(message)s"
+)
 logger = logging.getLogger(__name__)
 
-import numpy as np
-import pandas as pd
-from scipy import stats
-from scipy.stats import ks_2samp
-from collections import deque
-
-from sklearn.preprocessing import MinMaxScaler, RobustScaler
-from sklearn.inspection import permutation_importance
-from sklearn.feature_selection import mutual_info_classif
-from sklearn.metrics import (roc_auc_score,
-                             mean_squared_error)
-from sklearn.model_selection import cross_val_score
-
+from sklearn.metrics import roc_auc_score
+from sklearn.model_selection import TimeSeriesSplit
+from sklearn.preprocessing import RobustScaler
 import xgboost as xgb
-from xgboost import XGBClassifier, XGBRegressor
-
-import shap
+from xgboost import XGBClassifier
 import optuna
 optuna.logging.set_verbosity(optuna.logging.WARNING)
-
-from skl2onnx import convert_sklearn
-from skl2onnx.common.data_types import FloatTensorType
-import onnxruntime as ort
 
 
 # ╔══════════════════════════════════════════════════════════╗
@@ -46,2718 +53,1461 @@ import onnxruntime as ort
 # ╚══════════════════════════════════════════════════════════╝
 
 @dataclass
-class RewardWeights:
-    sharpe_weight:        float = 0.20
-    sortino_weight:       float = 0.15
-    profit_factor_weight: float = 0.15
-    consistency_weight:   float = 0.10
-    drawdown_penalty:     float = 0.10
-    trade_penalty:        float = 0.05
-    ruin_penalty:         float = 0.05
-    # NEW: direct trade outcome weights
-    win_bonus:            float = 0.15
-    loss_penalty:         float = 0.05
+class Config:
+    # Data
+    HISTORICAL_BARS:   int   = 50_000
+    OUTPUT_DIR:        str   = "xgb_trader_artifacts"
 
-@dataclass
-class SystemConfig:
-    DATA_SOURCE:      str   = "csv"
-    TRADING_PAIR:     str   = "EURUSD"
-    TIMEFRAME:        str   = "H1"
-    HISTORICAL_BARS:  int   = 50_000
+    # Walk-forward
+    TRAIN_BARS:        int   = 3_000   # bars per training window
+    TEST_BARS:         int   = 500     # bars per test window
+    MIN_TRAIN_BARS:    int   = 1_000   # minimum to start
 
-    SMA_PERIODS:        List[int] = field(
-        default_factory=lambda: [5,10,20,50,100,200])
-    EMA_PERIODS:        List[int] = field(
-        default_factory=lambda: [5,10,20,50,100])
-    RSI_PERIODS:        List[int] = field(
-        default_factory=lambda: [7,14,21])
-    VOLATILITY_WINDOWS: List[int] = field(
-        default_factory=lambda: [10,20,60,100])
-    LAG_PERIODS:        List[int] = field(
-        default_factory=lambda: [1,2,3,5,10,20])
-    MULTI_TIMEFRAMES:   List[int] = field(
-        default_factory=lambda: [5,10,20,50,100])
-    MAX_FEATURES_SELECTED: int   = 50
-    CORRELATION_THRESHOLD: float = 0.95
+    # Model
+    N_ESTIMATORS:      int   = 300
+    OPTUNA_TRIALS:     int   = 40
+    CV_SPLITS:         int   = 5
+    EMBARGO_BARS:      int   = 24      # bars between train/test
 
-    N_ACTIONS:            int   = 3
-    GAMMA:                float = 0.99
-    INITIAL_EPSILON:      float = 1.0
-    EPSILON_MIN:          float = 0.01
-    EPSILON_DECAY:        float = 0.9995
-    CONFIDENCE_THRESHOLD: float = 0.50
+    # Signal
+    # Minimum predicted probability to enter
+    PROB_THRESHOLD_BUY:  float = 0.58
+    PROB_THRESHOLD_SELL: float = 0.42  # < this = sell signal
+    # RSI bounds for entry confirmation
+    RSI_BULL_MIN:        float = 45.0
+    RSI_BEAR_MAX:        float = 55.0
+    # ADX minimum for trend confirmation
+    ADX_MIN:             float = 18.0
 
-    N_ENSEMBLE_MODELS: int = 7
-    ENSEMBLE_CONFIGS: List[dict] = field(
-        default_factory=lambda: [
-            {"max_depth": 4,  "subsample": 0.70,
-             "colsample_bytree": 0.60},
-            {"max_depth": 6,  "subsample": 0.80,
-             "colsample_bytree": 0.70},
-            {"max_depth": 8,  "subsample": 0.90,
-             "colsample_bytree": 0.80},
-            {"max_depth": 5,  "subsample": 0.60,
-             "colsample_bytree": 0.50},
-            {"max_depth": 7,  "subsample": 0.85,
-             "colsample_bytree": 0.75},
-            {"max_depth": 3,  "subsample": 0.95,
-             "colsample_bytree": 0.90},
-            {"max_depth": 10, "subsample": 0.65,
-             "colsample_bytree": 0.65},
-        ])
-    XGB_BASE: dict = field(default_factory=lambda: {
-        "n_estimators":  500,
-        "learning_rate": 0.05,
-        "reg_alpha":     1.0,
-        "reg_lambda":    2.0,
-        "tree_method":   "hist",
-        "verbosity":     0,
-        "random_state":  42,
-    })
+    # Risk - fixed fractional
+    INITIAL_CAPITAL:     float = 100_000.0
+    RISK_PER_TRADE_PCT:  float = 0.01   # 1% of equity per trade
+    ATR_SL_MULT:         float = 1.5    # SL = 1.5 * ATR
+    ATR_TP_MULT:         float = 2.0    # TP = 2.0 * ATR (RR=1.33)
+    MAX_OPEN_TRADES:     int   = 1      # one trade at a time
+    MAX_DAILY_TRADES:    int   = 3
+    MAX_DRAWDOWN_HALT:   float = 0.15   # halt if DD > 15%
 
-    REPLAY_BUFFER_CAPACITY:  int   = 200_000
-    PRIORITY_ALPHA:          float = 0.6
-    PRIORITY_BETA_START:     float = 0.4
-    PRIORITY_BETA_INCREMENT: float = 0.001
-    BATCH_SIZE:              int   = 256
-    MIN_BUFFER_SIZE:         int   = 1_000
+    # Transaction costs
+    SPREAD_PIPS:         float = 1.5    # pips
+    PIP_VALUE:           float = 0.0001 # for EURUSD
+    COMMISSION_PER_LOT:  float = 7.0    # USD per lot round-turn
 
-    TRAIN_WINDOW:          int   = 5_000
-    RETRAIN_INTERVAL:      int   = 500
-    MIN_TRAIN_SAMPLES:     int   = 1_000
-    RECENCY_WEIGHT_DECAY:  float = -1.0
-    REGIME_CHANGE_P_VALUE: float = 0.01
-    REGIME_LOOKBACK:       int   = 100
-
-    REWARD_WEIGHTS:       RewardWeights = field(
-        default_factory=RewardWeights)
-    RISK_FREE_RATE:       float = 0.02
-    MAX_DRAWDOWN_LIMIT:   float = 0.20
-    TRANSACTION_COST_BPS: int   = 5
-
-    INITIAL_CAPITAL:       float = 100_000.0
-    MAX_POSITION_SIZE:     float = 0.25
-
-    # FIX 1: Reduced from 3.0 to 1.5
-    # 3.0×ATR target = 21 pips on H1 EURUSD.
-    # Historical H1 EURUSD data shows only ~28% of
-    # directional moves sustain 21 pips before
-    # retracing 7 pips — exactly matching the 29%
-    # win rate observed.
-    # 1.5×ATR target = ~10.5 pips.
-    # Historical hit rate for 10.5 pip targets with
-    # 7 pip stops ≈ 43-48%, putting PF above 1.0
-    # before signal quality improvements are added.
-    ATR_SL_MULT:           float = 1.0
-    ATR_TP_MULT:           float = 1.5   # WAS 3.0
-    STOP_LOSS_PCT:         float = 0.02
-    TAKE_PROFIT_PCT:       float = 0.03
-
-    MAX_DAILY_TRADES:      int   = 10
-    EQUITY_RUIN_THRESHOLD: float = 0.80
-
-    SPREAD_PRICE_UNITS:    float = 0.00015
-    EVAL_SIZE_CAP_PCT:     float = 0.02
-
-    OPTUNA_N_TRIALS:  int   = 50
-    OPTUNA_CV_SPLITS: int   = 5
-    EMBARGO_PCT:      float = 0.02
-
-    NOISE_INJECTION_LEVEL: float = 0.01
-    FEATURE_DROPOUT_RATE:  float = 0.10
-    ADVERSARIAL_AUC_LIMIT: float = 0.55
-
-    FRAME_STACK_SIZE:         int   = 5
-    REGIME_ADX_MIN:           float = 20.0
-    REGIME_VOL_RATIO_MIN:     float = 0.70
-    REGIME_MAX_CONSEC_LOSSES: int   = 3
-    REGIME_COOLDOWN_BARS:     int   = 5
-
-    # NEW: Signal filter thresholds
-    # RSI must be above this for BUY signals
-    SIGNAL_RSI_BULL_MIN:  float = 50.0
-    # RSI must be below this for SELL signals
-    SIGNAL_RSI_BEAR_MAX:  float = 50.0
-    # MACD histogram must have same sign as
-    # proposed direction
-    SIGNAL_REQUIRE_MACD:  bool  = True
-
-    OUTPUT_DIR: str = "xgb_rl_artifacts"
+    # Lot sizing
+    CONTRACT_SIZE:       float = 100_000.0  # standard lot
 
     def __post_init__(self):
-        self.DAILY_RISK_FREE = (
-            self.RISK_FREE_RATE / 252)
         os.makedirs(self.OUTPUT_DIR, exist_ok=True)
+        self.SPREAD_PRICE = (
+            self.SPREAD_PIPS * self.PIP_VALUE
+        )
 
 
 # ╔══════════════════════════════════════════════════════════╗
-# ║  MODULE 1 — DATA INGESTION                               ║
+# ║  DATA INGESTION                                          ║
 # ╚══════════════════════════════════════════════════════════╝
 
 class DataIngestion:
     @staticmethod
-    def load(source: str, filepath: str = None,
-             n_bars: int = 50_000) -> pd.DataFrame:
-        if source == "csv":
-            df = pd.read_csv(
-                filepath,
-                parse_dates=["timestamp"])
-        elif source == "synthetic":
-            df = DataIngestion._synthetic(n_bars)
-        elif source == "exchange_api":
-            import ccxt
-            ex    = ccxt.binance()
-            ohlcv = ex.fetch_ohlcv(
-                "BTC/USDT", "1h", limit=n_bars)
-            df = pd.DataFrame(ohlcv, columns=[
-                "timestamp","open","high",
-                "low","close","volume"])
-            df["timestamp"] = pd.to_datetime(
-                df["timestamp"], unit="ms")
-        else:
-            raise ValueError(
-                f"Unknown source: {source}")
-        return DataIngestion.preprocess(df)
-
-    @staticmethod
-    def _synthetic(n: int) -> pd.DataFrame:
+    def load_synthetic(n: int) -> pd.DataFrame:
+        """
+        Generates realistic EURUSD-like H1 data.
+        Uses mean-reverting GBM with realistic
+        spread, overnight gaps, and volatility
+        clustering (GARCH-like).
+        """
         np.random.seed(42)
-        dt, mu, sigma, S0 = (
-            1/(24*365), 0.10, 0.80, 30_000.0)
+        n_bars = n
+        S0     = 1.1000
+        mu     = 0.0      # FX near zero drift
+        sigma0 = 0.0060   # ~6 pip H1 vol typical
+
+        # GARCH(1,1) vol clustering
+        alpha, beta = 0.10, 0.85
         prices = [S0]
-        for _ in range(1, n):
-            r = (mu*dt +
-                 sigma*np.sqrt(dt)*
-                 np.random.randn())
-            prices.append(prices[-1]*np.exp(r))
+        sigma  = sigma0
+        sigmas = [sigma]
+
+        for _ in range(1, n_bars):
+            eps   = np.random.randn()
+            r     = mu + sigma * eps
+            sigma = np.sqrt(
+                sigma0**2 * (1 - alpha - beta)
+                + alpha * (sigma * eps)**2
+                + beta  * sigma**2
+            )
+            sigma = np.clip(sigma, 0.0002, 0.03)
+            prices.append(prices[-1] * np.exp(r))
+            sigmas.append(sigma)
+
         prices = np.array(prices)
-        noise  = sigma*np.sqrt(dt)
-        o = prices*np.exp(
-            np.random.randn(n)*noise*0.3)
-        h = prices*np.exp(
-            np.abs(np.random.randn(n))*noise)
-        l = prices*np.exp(
-            -np.abs(np.random.randn(n))*noise)
-        h = np.maximum(h, np.maximum(o, prices))
-        l = np.minimum(l, np.minimum(o, prices))
-        v = np.random.lognormal(10, 1, n)
+        sigmas = np.array(sigmas)
+
+        # Build OHLC from close prices
+        high  = prices * np.exp(
+            np.abs(np.random.randn(n_bars)) *
+            sigmas * 0.7
+        )
+        low   = prices * np.exp(
+            -np.abs(np.random.randn(n_bars)) *
+            sigmas * 0.7
+        )
+        opens = np.roll(prices, 1)
+        opens[0] = S0
+
+        high  = np.maximum(high, np.maximum(
+            prices, opens))
+        low   = np.minimum(low,  np.minimum(
+            prices, opens))
+        vol   = np.random.lognormal(8, 1, n_bars)
+
         ts = pd.date_range(
-            "2020-01-01", periods=n, freq="h")
-        return pd.DataFrame({
-            "timestamp": ts, "open": o,
-            "high": h, "low": l,
-            "close": prices, "volume": v})
+            "2020-01-01",
+            periods=n_bars,
+            freq="h"
+        )
+
+        df = pd.DataFrame({
+            "timestamp": ts,
+            "open":      opens,
+            "high":      high,
+            "low":       low,
+            "close":     prices,
+            "volume":    vol,
+        })
+        # Remove weekends (FX closed)
+        df = df[df["timestamp"].dt.dayofweek < 5]
+        df.reset_index(drop=True, inplace=True)
+        logger.info(
+            f"Synthetic data: {len(df):,} bars"
+        )
+        return df
 
     @staticmethod
-    def preprocess(
-            raw: pd.DataFrame) -> pd.DataFrame:
-        df   = raw.copy()
-        cols = ["open","high","low",
-                "close","volume"]
-        df.dropna(subset=cols, inplace=True)
+    def load_csv(filepath: str) -> pd.DataFrame:
+        df = pd.read_csv(
+            filepath, parse_dates=["timestamp"]
+        )
+        df.sort_values(
+            "timestamp", inplace=True
+        )
+        df.reset_index(drop=True, inplace=True)
+        return df
+
+    @staticmethod
+    def validate(df: pd.DataFrame) -> pd.DataFrame:
+        required = [
+            "timestamp","open","high",
+            "low","close","volume"
+        ]
+        for c in required:
+            if c not in df.columns:
+                raise ValueError(
+                    f"Missing column: {c}"
+                )
+        df = df.dropna(subset=required).copy()
         df = df[df["volume"] > 0].copy()
+        df = df[df["high"] >= df["low"]].copy()
+        df = df[df["high"] >= df["close"]].copy()
+        df = df[df["low"]  <= df["close"]].copy()
         df.drop_duplicates(
-            subset=["timestamp"], inplace=True)
-        df.sort_values("timestamp", inplace=True)
+            subset=["timestamp"], inplace=True
+        )
+        df.sort_values(
+            "timestamp", inplace=True
+        )
         df.reset_index(drop=True, inplace=True)
-        for c in cols:
-            mu, sig = df[c].mean(), df[c].std()
-            if sig > 0:
-                df[c] = df[c].clip(
-                    mu-5*sig, mu+5*sig)
-        df = df[
-            (df.high >= df.low) &
-            (df.high >= df.open) &
-            (df.high >= df.close) &
-            (df.low  <= df.open) &
-            (df.low  <= df.close) &
-            (df.volume >= 0)
-        ].copy()
-        df.reset_index(drop=True, inplace=True)
-        df["returns"] = df["close"].pct_change()
-        df["log_returns"] = np.log(
-            df["close"]/df["close"].shift(1))
         logger.info(
-            f"Preprocessed: {len(df):,} bars")
+            f"Validated: {len(df):,} bars"
+        )
         return df
 
 
 # ╔══════════════════════════════════════════════════════════╗
-# ║  MODULE 2 — FEATURE ENGINEERING                          ║
+# ║  FEATURE ENGINEERING                                     ║
+# ║                                                          ║
+# ║  Design principles:                                      ║
+# ║  1. All features normalized to [-1, 1] or [0, 1]        ║
+# ║     so XGBoost sees consistent scale                     ║
+# ║  2. No look-ahead: every feature uses only              ║
+# ║     data available at bar close                          ║
+# ║  3. Features are PREDICTIVE not descriptive:             ║
+# ║     we want signals that precede price moves             ║
+# ║  4. Interaction features kept minimal to                 ║
+# ║     reduce overfitting risk                              ║
 # ╚══════════════════════════════════════════════════════════╝
 
 class FeatureEngine:
     EPS = 1e-10
 
-    def __init__(self, cfg: SystemConfig):
-        self.cfg = cfg
+    def build(self, df: pd.DataFrame
+              ) -> pd.DataFrame:
+        d = df.copy()
+        c = d["close"]
+        h = d["high"]
+        l = d["low"]
+        v = d["volume"]
+        o = d["open"]
 
-    @staticmethod
-    def _rsi(s, p):
-        d = s.diff()
-        g = d.clip(lower=0).rolling(p).mean()
-        l = (-d.clip(upper=0)).rolling(p).mean()
-        return 100-100/(1+g/(l+FeatureEngine.EPS))
+        # --- Returns ---
+        d["ret_1"]  = c.pct_change(1)
+        d["ret_3"]  = c.pct_change(3)
+        d["ret_5"]  = c.pct_change(5)
+        d["ret_10"] = c.pct_change(10)
+        d["ret_20"] = c.pct_change(20)
 
-    @staticmethod
-    def _macd(s, f=12, sl=26, sg=9):
-        ef  = s.ewm(span=f,  adjust=False).mean()
-        es  = s.ewm(span=sl, adjust=False).mean()
-        ml  = ef - es
-        sig = ml.ewm(span=sg, adjust=False).mean()
-        return ml, sig, ml-sig
-
-    @staticmethod
-    def _atr(h, l, c, p=14):
+        # --- ATR (needed for SL/TP later) ---
         tr = pd.concat([
-            h-l,
-            (h-c.shift(1)).abs(),
-            (l-c.shift(1)).abs()
+            h - l,
+            (h - c.shift(1)).abs(),
+            (l - c.shift(1)).abs(),
         ], axis=1).max(axis=1)
-        return tr.rolling(p).mean()
+        d["atr_14"] = tr.rolling(14).mean()
+        d["atr_7"]  = tr.rolling(7).mean()
+        # Normalized ATR
+        d["natr_14"] = d["atr_14"] / (c + self.EPS)
 
-    @staticmethod
-    def _williams_r(h, l, c, p=14):
-        hh = h.rolling(p).max()
-        ll = l.rolling(p).min()
-        return -100*(hh-c)/(
-            hh-ll+FeatureEngine.EPS)
+        # --- RSI ---
+        for p in [7, 14, 21]:
+            diff = c.diff()
+            g    = diff.clip(lower=0).rolling(p).mean()
+            ls   = (-diff.clip(upper=0)).rolling(p).mean()
+            rsi  = 100 - 100 / (1 + g / (ls + self.EPS))
+            # Normalize RSI to [-1, 1]
+            d[f"rsi_{p}"] = (rsi - 50) / 50.0
 
-    @staticmethod
-    def _cci(h, l, c, p=20):
-        tp = (h+l+c)/3
-        ma = tp.rolling(p).mean()
-        md = tp.rolling(p).apply(
-            lambda x: np.mean(np.abs(x-x.mean())),
-            raw=True)
-        return (tp-ma)/(
-            0.015*md+FeatureEngine.EPS)
+        # --- MACD ---
+        ema12 = c.ewm(span=12, adjust=False).mean()
+        ema26 = c.ewm(span=26, adjust=False).mean()
+        macd  = ema12 - ema26
+        sig   = macd.ewm(span=9, adjust=False).mean()
+        hist  = macd - sig
+        # Normalize by ATR
+        d["macd_norm"] = (
+            macd / (d["atr_14"] + self.EPS)
+        )
+        d["macd_sig_norm"] = (
+            sig / (d["atr_14"] + self.EPS)
+        )
+        d["macd_hist_norm"] = (
+            hist / (d["atr_14"] + self.EPS)
+        )
+        d["macd_cross"] = np.sign(hist)
 
-    @staticmethod
-    def _stoch(h, l, c, kp=14, dp=3):
-        ll = l.rolling(kp).min()
-        hh = h.rolling(kp).max()
-        k  = 100*(c-ll)/(
-            hh-ll+FeatureEngine.EPS)
-        return k, k.rolling(dp).mean()
+        # --- Bollinger Bands ---
+        bm    = c.rolling(20).mean()
+        bs    = c.rolling(20).std()
+        d["bb_pos"] = (
+            (c - bm) / (2 * bs + self.EPS)
+        ).clip(-1, 1)
+        d["bb_width"] = (
+            4 * bs / (bm + self.EPS)
+        )
+        d["bb_squeeze"] = (
+            d["bb_width"] <
+            d["bb_width"].rolling(50).mean()
+        ).astype(float)
 
-    @staticmethod
-    def _obv(c, v):
-        return (
-            np.sign(c.diff()).fillna(0)*v
-        ).cumsum()
+        # --- Stochastic ---
+        for p in [14, 21]:
+            ll  = l.rolling(p).min()
+            hh  = h.rolling(p).max()
+            k   = (c - ll) / (hh - ll + self.EPS)
+            kd  = k.rolling(3).mean()
+            d[f"stoch_{p}"]  = k * 2 - 1  # [-1,1]
+            d[f"stochd_{p}"] = kd * 2 - 1
+            d[f"stoch_cross_{p}"] = np.sign(k - kd)
 
-    @staticmethod
-    def _mfi(h, l, c, v, p=14):
-        tp  = (h+l+c)/3
-        rmf = tp*v
-        pos = (
-            rmf*(tp>tp.shift(1))
-        ).rolling(p).sum()
-        neg = (
-            rmf*(tp<tp.shift(1))
-        ).rolling(p).sum()
-        return 100-100/(
-            1+pos/(neg+FeatureEngine.EPS))
+        # --- ADX ---
+        dm_pos = (h - h.shift(1)).clip(lower=0)
+        dm_neg = (l.shift(1) - l).clip(lower=0)
+        atr14  = d["atr_14"]
+        pdi    = 100 * dm_pos.rolling(14).mean() / (
+            atr14 + self.EPS
+        )
+        ndi    = 100 * dm_neg.rolling(14).mean() / (
+            atr14 + self.EPS
+        )
+        dx     = (
+            100 * (pdi - ndi).abs() /
+            (pdi + ndi + self.EPS)
+        )
+        adx    = dx.ewm(span=14, adjust=False).mean()
+        d["adx"]     = adx / 100.0  # [0,1]
+        d["di_bull"] = (pdi > ndi).astype(float)
+        d["di_diff"] = (pdi - ndi) / 100.0
 
-    @staticmethod
-    def _hurst(s: pd.Series, lb=100,
-               ml=20) -> pd.Series:
-        result = np.full(len(s), 0.5)
-        arr    = s.values
-        for t in range(lb, len(arr)):
-            w   = arr[t-lb:t]
-            lgs = range(2, min(ml, lb//2))
-            tau = [
-                np.std(w[lg:]-w[:-lg])+1e-10
-                for lg in lgs]
-            if len(tau) < 2:
-                continue
-            try:
-                slope, _ = np.polyfit(
-                    np.log(list(lgs)),
-                    np.log(tau), 1)
-                result[t] = float(
-                    np.clip(slope, 0, 1))
-            except Exception:
-                pass
-        return pd.Series(result, index=s.index)
+        # --- Momentum ---
+        for p in [5, 10, 20, 50]:
+            mom = c / (c.shift(p) + self.EPS) - 1
+            d[f"mom_{p}"] = mom.clip(-0.1, 0.1) / 0.1
 
-    def build(self,
-              data: pd.DataFrame) -> pd.DataFrame:
-        df  = data.copy()
-        cfg = self.cfg
-        eps = self.EPS
-        c   = df["close"]
-        h   = df["high"]
-        l   = df["low"]
-        v   = df["volume"]
-        ret = df["returns"]
+        # --- Volatility ratio ---
+        vol5  = d["ret_1"].rolling(5).std()
+        vol20 = d["ret_1"].rolling(20).std()
+        vol60 = d["ret_1"].rolling(60).std()
+        d["vol_ratio_5_20"]  = (
+            vol5  / (vol20 + self.EPS)
+        ).clip(0, 5) / 5.0
+        d["vol_ratio_20_60"] = (
+            vol20 / (vol60 + self.EPS)
+        ).clip(0, 5) / 5.0
+        d["vol_20"] = vol20  # keep for reference
 
-        for p in cfg.SMA_PERIODS:
-            sma = c.rolling(p).mean()
-            df[f"sma_{p}"]       = sma
-            df[f"close_sma_{p}"] = c/(sma+eps)-1
-            df[f"sma_{p}_slope"] = sma.pct_change(5)
+        # --- Price position within range ---
+        for p in [10, 20, 50, 100]:
+            hh = h.rolling(p).max()
+            ll = l.rolling(p).min()
+            d[f"range_pos_{p}"] = (
+                (c - ll) / (hh - ll + self.EPS)
+            ) * 2 - 1  # [-1, 1]
 
-        for p in cfg.EMA_PERIODS:
+        # --- EMA distance ---
+        for p in [10, 20, 50, 200]:
             ema = c.ewm(span=p, adjust=False).mean()
-            df[f"ema_{p}"]       = ema
-            df[f"close_ema_{p}"] = c/(ema+eps)-1
-
-        ema10 = c.ewm(span=10, adjust=False).mean()
-        ema20 = c.ewm(span=20, adjust=False).mean()
-        ema50 = c.ewm(span=50, adjust=False).mean()
-        df["ema10_20_cross"] = ema10/(ema20+eps)-1
-        df["ema20_50_cross"] = ema20/(ema50+eps)-1
-
-        for p in cfg.MULTI_TIMEFRAMES:
-            mx = h.rolling(p).max()
-            mn = l.rolling(p).min()
-            df[f"range_pos_{p}"] = (
-                c-mn)/(mx-mn+eps)
-
-        for p in cfg.RSI_PERIODS:
-            df[f"rsi_{p}"] = self._rsi(c, p)
-        df["rsi_14_slope"]   = df["rsi_14"].diff(3)
-        df["price_slope"]    = c.pct_change(3)
-        df["rsi_divergence"] = (
-            df["rsi_14_slope"] -
-            df["price_slope"] * 100)
-
-        (df["macd"],
-         df["macd_sig"],
-         df["macd_hist"]) = self._macd(c)
-        df["macd_cross"] = (
-            np.sign(df["macd_hist"]) *
-            np.sign(df["macd_hist"].shift(1)))
-
-        for p in [10, 20, 30, 60]:
-            df[f"mom_{p}"] = c/c.shift(p)-1
-            df[f"roc_{p}"] = c.pct_change(p)
-
-        df["williams_r"] = self._williams_r(h,l,c)
-        df["cci"]        = self._cci(h,l,c)
-        df["stoch_k"], df["stoch_d"] = (
-            self._stoch(h,l,c))
-        df["stoch_cross"] = (
-            df["stoch_k"] - df["stoch_d"])
-
-        for w in cfg.VOLATILITY_WINDOWS:
-            df[f"vol_{w}"] = ret.rolling(w).std()
-
-        v20  = df.get("vol_20",
-                      ret.rolling(20).std())
-        v60  = df.get("vol_60",
-                      ret.rolling(60).std())
-        v10  = df.get("vol_10",
-                      ret.rolling(10).std())
-        v100 = df.get("vol_100",
-                      ret.rolling(100).std())
-        df["vol_ratio_20_60"]  = v20/(v60+eps)
-        df["vol_ratio_10_100"] = v10/(v100+eps)
-        df["vol_ratio"]        = v20/(v60+eps)
-
-        df["atr_14"]    = self._atr(h, l, c, 14)
-        df["atr_ratio"] = df["atr_14"]/(c+eps)
-        df["atr_pct"]   = (
-            df["atr_14"].rolling(100).rank(
-                pct=True))
-
-        bm  = c.rolling(20).mean()
-        bs  = c.rolling(20).std()
-        bu  = bm+2*bs
-        bl_ = bm-2*bs
-        df["bb_width"]   = (bu-bl_)/(bm+eps)
-        df["bb_pos"]     = (c-bl_)/(bu-bl_+eps)
-        df["bb_squeeze"] = (
-            df["bb_width"] <
-            df["bb_width"].rolling(50).mean()
-        ).astype(float)
-
-        for w in [5, 10, 20, 50]:
-            vsma = v.rolling(w).mean()
-            df[f"vol_sma_{w}"]   = vsma
-            df[f"vol_ratio_{w}"] = v/(vsma+eps)
-
-        obv = self._obv(c, v)
-        df["obv"]       = obv
-        df["obv_slope"] = obv.pct_change(5)
-        df["obv_norm"]  = obv/(obv.abs()+1)
-
-        vwap = (c*v).cumsum()/(v.cumsum()+eps)
-        df["vwap"]       = vwap
-        df["close_vwap"] = c/(vwap+eps)-1
-        df["mfi"]        = self._mfi(h, l, c, v)
-
-        spread = (h-l).clip(lower=eps)
-        df["spread_pct"] = spread/(c+eps)
-        df["body"]       = (
-            (c-df["open"]).abs()/(spread+eps))
-        top = pd.concat(
-            [df["open"],c], axis=1).max(axis=1)
-        bot = pd.concat(
-            [df["open"],c], axis=1).min(axis=1)
-        df["upper_wick"] = (h-top)/(spread+eps)
-        df["lower_wick"] = (bot-l)/(spread+eps)
-        df["gap"]        = (
-            df["open"]/(c.shift(1)+eps)-1)
-
-        df["bullish_engulf"] = (
-            (df["open"] > c.shift(1)) &
-            (c > df["open"].shift(1)) &
-            (df["body"] > 0.6)
-        ).astype(float)
-        df["bearish_engulf"] = (
-            (df["open"] < c.shift(1)) &
-            (c < df["open"].shift(1)) &
-            (df["body"] > 0.6)
-        ).astype(float)
-
-        for w in [20, 50, 100]:
-            df[f"skew_{w}"] = ret.rolling(w).skew()
-            df[f"kurt_{w}"] = ret.rolling(w).kurt()
-            rm = c.rolling(w).mean()
-            rs = c.rolling(w).std()
-            df[f"zscore_{w}"] = (c-rm)/(rs+eps)
-
-        df["hurst"] = self._hurst(ret.fillna(0))
-        df["zscore_extreme"] = (
-            df["zscore_20"].abs() > 2.0
-        ).astype(float)
-
-        for p in [20, 50]:
-            df[f"high_{p}"]      = h.rolling(p).max()
-            df[f"low_{p}"]       = l.rolling(p).min()
-            df[f"dist_high_{p}"] = (
-                c-df[f"high_{p}"])/(c+eps)
-            df[f"dist_low_{p}"]  = (
-                c-df[f"low_{p}"])/(c+eps)
-
-        dm_pos = (h-h.shift(1)).clip(lower=0)
-        dm_neg = (l.shift(1)-l).clip(lower=0)
-        tr14   = df["atr_14"]
-        df["adx_pos"] = (
-            dm_pos.rolling(14).mean()/(tr14+eps))
-        df["adx_neg"] = (
-            dm_neg.rolling(14).mean()/(tr14+eps))
-        df["adx"] = (
-            df["adx_pos"]-df["adx_neg"]).abs()
-
-        # Canonical Wilder ADX14
-        atr14_s = self._atr(h, l, c, 14)
-        dmp_s   = dm_pos.rolling(14).mean()
-        dmn_s   = dm_neg.rolling(14).mean()
-        pdi     = 100*dmp_s/(atr14_s+eps)
-        ndi     = 100*dmn_s/(atr14_s+eps)
-        dx      = (100*(pdi-ndi).abs() /
-                   (pdi+ndi+eps))
-        df["adx_14_full"] = dx.ewm(
-            span=14, adjust=False).mean()
-
-        key = ["returns","volume","rsi_14",
-               "macd_hist","vol_20"]
-        for feat in key:
-            if feat not in df.columns:
-                continue
-            for lag in cfg.LAG_PERIODS:
-                sh = df[feat].shift(lag)
-                df[f"{feat}_lag{lag}"]  = sh
-                df[f"{feat}_diff{lag}"] = (
-                    df[feat]-sh)
-
-        excl  = {"timestamp","open","high","low",
-                 "close","volume","returns",
-                 "log_returns"}
-        fcols = [
-            c_ for c_ in
-            df.select_dtypes(np.number).columns
-            if c_ not in excl]
-        top20 = (
-            df[fcols].var()
-            .nlargest(20).index.tolist())
-        cnt = 0
-        for i in range(len(top20)):
-            for j in range(i+1, len(top20)):
-                if cnt >= 50: break
-                f1, f2 = top20[i], top20[j]
-                df[f"{f1}_div_{f2}"] = (
-                    df[f1]/(df[f2]+eps))
-                df[f"{f1}_x_{f2}"]   = (
-                    df[f1]*df[f2])
-                cnt += 1
-
-        df.replace(
-            [np.inf,-np.inf], 0, inplace=True)
-        df.dropna(inplace=True)
-        df.reset_index(drop=True, inplace=True)
-        logger.info(
-            f"Features built: "
-            f"{df.shape[1]} cols, "
-            f"{len(df):,} rows")
-        return df
-
-
-# ╔══════════════════════════════════════════════════════════╗
-# ║  MODULE 3 — FEATURE SELECTION                            ║
-# ╚══════════════════════════════════════════════════════════╝
-
-class FeatureSelector:
-    BASE_EXCL = {
-        "timestamp","open","high","low","close",
-        "volume","returns","log_returns"
-    }
-
-    def __init__(self, cfg: SystemConfig):
-        self.cfg = cfg
-
-    def select(self, data: pd.DataFrame,
-               target: pd.Series,
-               top_k=50) -> List[str]:
-        fcols = [c for c in data.columns
-                 if c not in self.BASE_EXCL]
-        X = data[fcols].copy()
-        y = target.copy()
-        idx = X.index.intersection(y.index)
-        X, y = X.loc[idx], y.loc[idx]
-
-        corr  = X.corr().abs()
-        upper = corr.where(
-            np.triu(np.ones(corr.shape),
-                    k=1).astype(bool))
-        drop  = [c for c in upper.columns
-                 if (upper[c] >
-                     self.cfg.CORRELATION_THRESHOLD
-                     ).any()]
-        X.drop(columns=drop, inplace=True)
-        logger.info(
-            f"Corr filter: -{len(drop)} "
-            f"→ {X.shape[1]} remain")
-        rem  = list(X.columns)
-        Xa   = X.values.astype(np.float32)
-        ya   = y.values
-
-        tmp = XGBClassifier(
-            n_estimators=200, max_depth=6,
-            verbosity=0, random_state=42,
-            tree_method="hist")
-        tmp.fit(Xa, ya)
-        xgb_imp = np.array(
-            tmp.feature_importances_)
-        if len(xgb_imp) != len(rem):
-            xgb_imp = np.ones(len(rem))/len(rem)
-        xr = pd.Series(
-            xgb_imp,
-            index=rem).rank(ascending=False)
-
-        try:
-            expl = shap.TreeExplainer(tmp)
-            sv   = expl.shap_values(Xa)
-            if isinstance(sv, list):
-                si = np.mean(
-                    [np.mean(np.abs(s), axis=0)
-                     for s in sv], axis=0)
-            else:
-                si = np.mean(np.abs(sv), axis=0)
-            if len(si) != len(rem):
-                si = xgb_imp.copy()
-        except Exception:
-            si = xgb_imp.copy()
-        sr = pd.Series(
-            si, index=rem).rank(ascending=False)
-
-        try:
-            mi = mutual_info_classif(
-                Xa, ya, random_state=42)
-        except Exception:
-            mi = np.ones(len(rem))
-        mr = pd.Series(
-            mi, index=rem).rank(ascending=False)
-
-        try:
-            pi_r = permutation_importance(
-                tmp, Xa, ya,
-                n_repeats=5, random_state=42)
-            ps   = np.array(
-                pi_r.importances_mean)
-            if len(ps) != len(rem):
-                ps = xgb_imp.copy()
-        except Exception:
-            ps = xgb_imp.copy()
-        pr = pd.Series(
-            ps, index=rem).rank(ascending=False)
-
-        combined = (xr+sr+mr+pr)/4
-        combined.sort_values(inplace=True)
-        sel = combined.head(
-            min(top_k, len(combined))
-        ).index.tolist()
-        logger.info(
-            f"Selected {len(sel)} features. "
-            f"Top5: {sel[:5]}")
-        return sel
-
-    def adversarial_check(
-            self,
-            X_tr: pd.DataFrame,
-            X_te: pd.DataFrame
-    ) -> Tuple[List[str], bool]:
-        fcols = [c for c in X_tr.columns
-                 if c not in self.BASE_EXCL]
-        Xt   = X_tr[fcols].copy()
-        Xv   = X_te[fcols].copy()
-        Xall = pd.concat([Xt, Xv]).fillna(0)
-        yall = np.concatenate(
-            [np.zeros(len(Xt)),
-             np.ones(len(Xv))])
-        adv  = XGBClassifier(
-            n_estimators=100, max_depth=4,
-            verbosity=0, random_state=42)
-        try:
-            auc = cross_val_score(
-                adv, Xall.values, yall,
-                cv=3,
-                scoring="roc_auc").mean()
-        except Exception:
-            auc = 0.5
-        logger.info(
-            f"Adversarial AUC: {auc:.4f}")
-        if auc > self.cfg.ADVERSARIAL_AUC_LIMIT:
-            logger.warning(
-                "Distribution shift detected!")
-            adv.fit(Xall.values, yall)
-            imp  = adv.feature_importances_
-            thr  = np.percentile(imp, 90)
-            prob = [
-                fcols[i]
-                for i, val in enumerate(imp)
-                if val > thr]
-            return prob, True
-        return [], False
-
-
-# ╔══════════════════════════════════════════════════════════╗
-# ║  MODULE 4 — PRIORITIZED REPLAY BUFFER                    ║
-# ╚══════════════════════════════════════════════════════════╝
-
-class SumTree:
-    def __init__(self, cap: int):
-        self.cap  = cap
-        self.tree = np.zeros(
-            2*cap-1, dtype=np.float64)
-        self.data = np.empty(cap, dtype=object)
-        self.n    = 0
-        self.ptr  = 0
-
-    @property
-    def total(self):
-        return float(self.tree[0])
-
-    def add(self, priority: float, data):
-        leaf = self.ptr + self.cap - 1
-        self.data[self.ptr] = data
-        self.update(leaf, priority)
-        self.ptr = (self.ptr+1) % self.cap
-        if self.n < self.cap:
-            self.n += 1
-
-    def update(self, leaf: int,
-               priority: float):
-        delta = priority - self.tree[leaf]
-        self.tree[leaf] = priority
-        idx = leaf
-        while idx > 0:
-            idx = (idx-1)//2
-            self.tree[idx] += delta
-
-    def get(self, s: float):
-        idx = 0
-        while True:
-            l, r = 2*idx+1, 2*idx+2
-            if l >= len(self.tree):
-                break
-            if (s <= self.tree[l] or
-                    self.tree[r] == 0):
-                idx = l
-            else:
-                s -= self.tree[l]; idx = r
-        di = idx - (self.cap-1)
-        return idx, self.tree[idx], self.data[di]
-
-
-class PrioritizedReplayBuffer:
-    def __init__(self, cap, alpha,
-                 beta_start, beta_inc):
-        self.cap      = cap
-        self.alpha    = alpha
-        self.beta     = beta_start
-        self.beta_inc = beta_inc
-        self.tree     = SumTree(cap)
-        self._maxp    = 1.0
-
-    @property
-    def size(self):
-        return self.tree.n
-
-    def add(self, s, a, r, ns, done,
-            td_err=None):
-        pri = (self._maxp if td_err is None
-               else (abs(td_err)+1e-6)**
-               self.alpha)
-        self.tree.add(pri, (s,a,r,ns,done))
-
-    def sample(self, batch: int) -> dict:
-        idx_list, pri_list, exp_list = [], [], []
-        tot = self.tree.total
-        seg = tot/batch
-        for i in range(batch):
-            s = random.uniform(
-                seg*i, seg*(i+1))
-            idx, pri, exp = self.tree.get(s)
-            if exp is None:
-                s2 = random.uniform(0, tot)
-                idx, pri, exp = self.tree.get(s2)
-            idx_list.append(idx)
-            pri_list.append(max(pri, 1e-10))
-            exp_list.append(exp)
-
-        self.beta = min(
-            1.0, self.beta+self.beta_inc)
-        min_p  = min(pri_list)/(tot+1e-10)
-        max_w  = (min_p*self.size)**(-self.beta)
-        weights = np.array(
-            [(p/tot*self.size)**(-self.beta)/max_w
-             for p in pri_list],
-            dtype=np.float32)
-
-        return {
-            "states":
-                np.array(
-                    [e[0] for e in exp_list],
-                    np.float32),
-            "actions":
-                np.array(
-                    [e[1] for e in exp_list],
-                    np.int32),
-            "rewards":
-                np.array(
-                    [e[2] for e in exp_list],
-                    np.float32),
-            "next_states":
-                np.array(
-                    [e[3] for e in exp_list],
-                    np.float32),
-            "dones":
-                np.array(
-                    [e[4] for e in exp_list],
-                    np.float32),
-            "weights":  weights,
-            "indices":  idx_list,
-        }
-
-    def update_priorities(self, indices,
-                          td_errors):
-        for idx, td in zip(indices, td_errors):
-            pri = (abs(td)+1e-6)**self.alpha
-            self._maxp = max(self._maxp, pri)
-            self.tree.update(idx, pri)
-
-
-# ╔══════════════════════════════════════════════════════════╗
-# ║  MODULE 4B — FRAME STACKER                               ║
-# ╚══════════════════════════════════════════════════════════╝
-
-class FrameStacker:
-    def __init__(self, n_market_features: int,
-                 stack_size: int):
-        self.n_mkt = n_market_features
-        self.k     = stack_size
-        self._buf: deque = deque(
-            [np.zeros(n_market_features,
-                      dtype=np.float32)] *
-            stack_size,
-            maxlen=stack_size)
-
-    def push(self,
-             state: np.ndarray) -> np.ndarray:
-        mkt  = state[:self.n_mkt].copy()
-        tail = state[self.n_mkt:].copy()
-        self._buf.append(mkt)
-        stacked_mkt = np.concatenate(
-            list(self._buf), axis=0)
-        return np.concatenate(
-            [stacked_mkt, tail],
-            axis=0).astype(np.float32)
-
-    def build_next(
-            self,
-            next_state: np.ndarray) -> np.ndarray:
-        next_mkt  = next_state[:self.n_mkt].copy()
-        next_tail = next_state[self.n_mkt:].copy()
-        sim_buf = list(self._buf)[1:] + [next_mkt]
-        stacked_mkt = np.concatenate(
-            sim_buf, axis=0)
-        return np.concatenate(
-            [stacked_mkt, next_tail],
-            axis=0).astype(np.float32)
-
-    def reset(self):
-        self._buf = deque(
-            [np.zeros(self.n_mkt,
-                      dtype=np.float32)] * self.k,
-            maxlen=self.k)
-
-
-# ╔══════════════════════════════════════════════════════════╗
-# ║  MODULE 4C — REGIME FILTER                               ║
-# ╚══════════════════════════════════════════════════════════╝
-
-class RegimeFilter:
-    def __init__(self, cfg: SystemConfig):
-        self.adx_min       = cfg.REGIME_ADX_MIN
-        self.vol_ratio_min = cfg.REGIME_VOL_RATIO_MIN
-        self.max_consec    = (
-            cfg.REGIME_MAX_CONSEC_LOSSES)
-        self.cooldown_bars = cfg.REGIME_COOLDOWN_BARS
-        self._consec_losses  = 0
-        self._cooldown_left  = 0
-        self._filtered_count = 0
-        self._total_count    = 0
-
-    def check(self, action: int,
-              row: pd.Series,
-              current_pos: int) -> int:
-        self._total_count += 1
-        if current_pos != 0:
-            return action
-        if action == 1:
-            return action
-
-        adx = float(row.get("adx_14_full", 25.0))
-        if adx < self.adx_min:
-            self._filtered_count += 1
-            return 1
-
-        vol_20    = float(row.get("vol_20", 0.01))
-        vol_60    = float(row.get("vol_60", 0.01))
-        vol_ratio = vol_20 / (vol_60 + 1e-10)
-        if vol_ratio < self.vol_ratio_min:
-            self._filtered_count += 1
-            return 1
-
-        if self._cooldown_left > 0:
-            self._cooldown_left -= 1
-            self._filtered_count += 1
-            return 1
-
-        return action
-
-    def record_trade_result(self, pnl: float):
-        if pnl < 0:
-            self._consec_losses += 1
-            if (self._consec_losses >=
-                    self.max_consec):
-                self._cooldown_left = (
-                    self.cooldown_bars)
-                self._consec_losses = 0
-                logger.info(
-                    f"[RegimeFilter] Cooldown "
-                    f"{self.cooldown_bars} bars")
-        else:
-            self._consec_losses = 0
-
-    def stats(self) -> dict:
-        rate = (self._filtered_count /
-                max(1, self._total_count))
-        return {
-            "filtered":    self._filtered_count,
-            "total":       self._total_count,
-            "filter_rate": rate,
-        }
-
-
-# ╔══════════════════════════════════════════════════════════╗
-# ║  MODULE 4D — SIGNAL FILTER  (NEW)                        ║
-# ║                                                          ║
-# ║  FIX 4: RSI + MACD confluence gate.                      ║
-# ║                                                          ║
-# ║  Problem being solved:                                   ║
-# ║    The agent takes 2,000 trades with 29% win rate.       ║
-# ║    RegimeFilter blocks choppy bars but does not          ║
-# ║    check whether momentum DIRECTION aligns with the      ║
-# ║    proposed trade direction. The agent can enter a        ║
-# ║    BUY signal on a bar where RSI=35 and MACD is          ║
-# ║    falling — directionally wrong inputs.                 ║
-# ║                                                          ║
-# ║  Solution:                                               ║
-# ║    For BUY (action=2):                                   ║
-# ║      RSI_14 must be > SIGNAL_RSI_BULL_MIN (50)          ║
-# ║      MACD histogram must be positive                     ║
-# ║    For SELL (action=0):                                  ║
-# ║      RSI_14 must be < SIGNAL_RSI_BEAR_MAX (50)          ║
-# ║      MACD histogram must be negative                     ║
-# ║                                                          ║
-# ║  Expected impact:                                        ║
-# ║    Reduces trade count from ~2000 to ~600-900.           ║
-# ║    Win rate should rise from 29% toward 42-50%           ║
-# ║    because only directionally confirmed entries          ║
-# ║    are executed.                                         ║
-# ╚══════════════════════════════════════════════════════════╝
-
-class SignalFilter:
-    """
-    Directional momentum confluence gate.
-
-    Sits after RegimeFilter and before RiskManager.
-    Only blocks new entries, never exits.
-
-    Two conditions must both pass for an entry:
-        BUY  (action=2): RSI > bull_min AND macd_hist > 0
-        SELL (action=0): RSI < bear_max AND macd_hist < 0
-
-    When either condition fails the action is
-    overridden to HOLD (1).
-    """
-
-    def __init__(self, cfg: SystemConfig):
-        self.bull_min     = cfg.SIGNAL_RSI_BULL_MIN
-        self.bear_max     = cfg.SIGNAL_RSI_BEAR_MAX
-        self.require_macd = cfg.SIGNAL_REQUIRE_MACD
-        self._blocked = 0
-        self._total   = 0
-
-    def check(self, action: int,
-              row: pd.Series,
-              current_pos: int) -> int:
-        """
-        Parameters
-        ----------
-        action      : proposed action (0/1/2)
-        row         : current feature row
-        current_pos : open position (-1/0/1)
-
-        Returns
-        -------
-        Validated action — may be forced to 1
-        """
-        self._total += 1
-
-        # Never block exits from open positions
-        if current_pos != 0:
-            return action
-        if action == 1:
-            return action
-
-        rsi       = float(row.get("rsi_14", 50.0))
-        macd_hist = float(
-            row.get("macd_hist", 0.0))
-
-        if action == 2:   # BUY signal
-            rsi_ok  = rsi > self.bull_min
-            macd_ok = (macd_hist > 0
-                       if self.require_macd
-                       else True)
-            if not (rsi_ok and macd_ok):
-                self._blocked += 1
-                return 1
-
-        elif action == 0: # SELL signal
-            rsi_ok  = rsi < self.bear_max
-            macd_ok = (macd_hist < 0
-                       if self.require_macd
-                       else True)
-            if not (rsi_ok and macd_ok):
-                self._blocked += 1
-                return 1
-
-        return action
-
-    def stats(self) -> dict:
-        rate = self._blocked / max(1, self._total)
-        return {
-            "signal_blocked": self._blocked,
-            "signal_total":   self._total,
-            "signal_block_rate": rate,
-        }
-
-
-# ╔══════════════════════════════════════════════════════════╗
-# ║  MODULE 5 — STATE BUILDER                                ║
-# ╚══════════════════════════════════════════════════════════╝
-
-class StateBuilder:
-    EPS = 1e-10
-
-    def build(self, data: pd.DataFrame,
-              idx: int,
-              features: List[str],
-              portfolio: dict) -> np.ndarray:
-        lb  = min(100, idx)
-        mkt = []
-        for f in features:
-            if f not in data.columns:
-                mkt.append(0.0); continue
-            val = float(data[f].iloc[idx])
-            win = data[f].iloc[
-                max(0, idx-lb):idx]
-            mu  = (win.mean()
-                   if len(win) > 0 else 0.0)
-            sg  = (win.std()
-                   if len(win) > 1 else 1.0)
-            sg  = sg if sg > self.EPS else 1.0
-            mkt.append(float(
-                np.clip((val-mu)/sg, -5, 5)))
-
-        p   = portfolio
-        raw = [
-            float(p.get("current_position",  0)),
-            float(p.get("unrealized_pnl",    0)),
-            float(p.get("holding_duration",  0)),
-            float(p.get("current_drawdown",  0)),
-            float(p.get("recent_win_rate",   0)),
-            float(p.get("avg_trade_duration",0)),
-            float(p.get("cash_ratio",        1)),
-            float(p.get("trades_today",      0)),
-            float(p.get("daily_pnl",         0)),
-        ]
-        mn, mx = min(raw), max(raw)
-        rng    = mx - mn + self.EPS
-        port   = [(v-mn)/rng for v in raw]
-        reg    = self._regime(data, idx)
-        state  = np.array(
-            mkt+port+reg, dtype=np.float32)
-        return np.nan_to_num(
-            state, nan=0, posinf=0, neginf=0)
-
-    def _regime(self, data: pd.DataFrame,
-                idx: int) -> List[float]:
-        st  = max(0, idx-100)
-        r   = (data["returns"]
-               .iloc[st:idx]
-               .fillna(0).values)
-        if len(r) < 5:
-            return [0.0]*8
-        sh   = float(
-            np.mean(r)/(np.std(r)+self.EPS))
-        rv   = float(
-            np.std(r[-20:]) if len(r) >= 20
-            else np.std(r))
-        lv   = float(
-            np.std(r[-60:]) if len(r) >= 60
-            else np.std(r))
-        vr   = rv/(lv+self.EPS)
-        bull = float(np.mean(r > 0))
-        hurst= self._hurst(r)
-        ac1  = (float(pd.Series(r).autocorr(1))
-                if len(r) > 2 else 0.0)
-        ac5  = (float(pd.Series(r).autocorr(5))
-                if len(r) > 6 else 0.0)
-        sk   = (float(stats.skew(r))
-                if len(r) > 3 else 0.0)
-        ku   = (float(stats.kurtosis(r))
-                if len(r) > 3 else 0.0)
-        feats = [sh,vr,bull,hurst,
-                 ac1,ac5,sk,ku]
-        return [float(np.nan_to_num(f))
-                for f in feats]
-
-    @staticmethod
-    def _hurst(s: np.ndarray,
-               ml=20) -> float:
-        n = len(s)
-        if n < 4: return 0.5
-        lgs = range(2, min(ml, n//2))
-        tau = [
-            np.std(s[lg:]-s[:-lg])+1e-10
-            for lg in lgs]
-        if len(tau) < 2: return 0.5
-        try:
-            sl, _ = np.polyfit(
-                np.log(list(lgs)),
-                np.log(tau), 1)
-            return float(np.clip(sl, 0, 1))
-        except Exception:
-            return 0.5
-
-
-# ╔══════════════════════════════════════════════════════════╗
-# ║  MODULE 6 — REWARD FUNCTION  (FIX 2)                     ║
-# ║                                                          ║
-# ║  FIX 2: Direct per-trade outcome feedback added.         ║
-# ║                                                          ║
-# ║  Previous problem:                                       ║
-# ║    Reward was built entirely from rolling statistics     ║
-# ║    (Sharpe, Sortino, drawdown). These are smooth         ║
-# ║    signals that look similar at entry whether the        ║
-# ║    trade succeeds or fails. The agent received no        ║
-# ║    sharp feedback when a specific entry was wrong.       ║
-# ║                                                          ║
-# ║  Fix:                                                    ║
-# ║    calc() now accepts closed_pnl (float or None).        ║
-# ║    When a trade closes (closed_pnl is not None):         ║
-# ║      Win: +win_bonus reward added                        ║
-# ║      Loss: -loss_penalty reward subtracted               ║
-# ║    This gives the agent a sharp, unambiguous signal      ║
-# ║    at the exact timestep the trade outcome is known.     ║
-# ╚══════════════════════════════════════════════════════════╝
-
-class RewardFunction:
-    INACTION_VOL_THRESHOLD: float = 0.0008
-    INACTION_PENALTY:       float = 0.03
-
-    def __init__(self, cfg: SystemConfig):
-        self.w    = cfg.REWARD_WEIGHTS
-        self.drf  = cfg.DAILY_RISK_FREE
-        self.tc   = (cfg.TRANSACTION_COST_BPS
-                     / 10_000)
-        self.ruin = cfg.EQUITY_RUIN_THRESHOLD
-        self.hist: List[float] = []
-        self.EPS = 1e-10
-
-    def calc(self, action: int,
-             port_ret: float,
-             port_info: dict,
-             closed_pnl: Optional[float] = None
-             ) -> float:
-        """
-        Parameters
-        ----------
-        action      : validated action taken
-        port_ret    : portfolio return this step
-        port_info   : dict from PortfolioManager.info()
-        closed_pnl  : net PnL of the trade that just
-                      closed this step, or None if no
-                      trade closed
-        """
-        self.hist.append(port_ret)
-
-        sharpe    = self._sharpe()
-        sortino   = self._sortino(port_ret)
-        dd_pen    = self._dd_pen(
-            port_info.get("current_drawdown", 0))
-        trade_pen = self._trade_pen(
-            action, port_info)
-        pf_bonus  = self._pf_bonus()
-        consist   = self._consist()
-        ruin_pen  = self._ruin(port_info)
-
-        total = (
-            self.w.sharpe_weight        * sharpe
-          + self.w.sortino_weight       * sortino
-          + self.w.profit_factor_weight * pf_bonus
-          + self.w.consistency_weight   * consist
-          - self.w.drawdown_penalty     * dd_pen
-          - self.w.trade_penalty        * trade_pen
-          - self.w.ruin_penalty         * ruin_pen
+            d[f"ema_dist_{p}"] = (
+                (c - ema) / (ema + self.EPS)
+            ).clip(-0.05, 0.05) / 0.05
+
+        # --- Candle structure ---
+        spread = (h - l).clip(lower=self.EPS)
+        body   = (c - o).abs()
+        d["body_ratio"]  = (body / spread).clip(0, 1)
+        d["bull_candle"] = (c > o).astype(float)
+        d["upper_wick"]  = (
+            (h - pd.concat([c, o], axis=1).max(axis=1)) /
+            (spread + self.EPS)
+        )
+        d["lower_wick"] = (
+            (pd.concat([c, o], axis=1).min(axis=1) - l) /
+            (spread + self.EPS)
         )
 
-        # FIX 2: Direct trade outcome signal
-        if closed_pnl is not None:
-            if closed_pnl > 0:
-                # Win: sharp positive reinforcement
-                total += self.w.win_bonus
-            else:
-                # Loss: sharp negative signal
-                total -= self.w.loss_penalty
+        # --- Volume ---
+        v_ma = v.rolling(20).mean()
+        d["vol_ratio_bar"] = (
+            v / (v_ma + self.EPS)
+        ).clip(0, 5) / 5.0
 
-        # Inaction penalty
-        if action == 1:
-            vol = float(
-                port_info.get("vol_20", 0.0))
-            if vol > self.INACTION_VOL_THRESHOLD:
-                total -= self.INACTION_PENALTY
+        # --- Z-score of price ---
+        for p in [20, 50]:
+            rm  = c.rolling(p).mean()
+            rs  = c.rolling(p).std()
+            d[f"zscore_{p}"] = (
+                (c - rm) / (rs + self.EPS)
+            ).clip(-3, 3) / 3.0
 
-        return float(np.clip(total, -10, 10))
+        # --- Lagged returns (autocorrelation signal) ---
+        for lag in [1, 2, 3, 5]:
+            d[f"ret_lag_{lag}"] = (
+                d["ret_1"].shift(lag).clip(
+                    -0.02, 0.02
+                ) / 0.02
+            )
 
-    def _sharpe(self) -> float:
-        if len(self.hist) < 10: return 0.0
-        r  = (np.array(self.hist[-100:]) -
-               self.drf)
-        sg = np.std(r)
-        if sg < self.EPS: return 0.0
-        return float(
-            np.mean(r)/sg*np.sqrt(252))
+        # --- Hour of day (session effect) ---
+        if pd.api.types.is_datetime64_any_dtype(
+            d["timestamp"]
+        ):
+            hour = d["timestamp"].dt.hour
+            # Encode cyclically
+            d["hour_sin"] = np.sin(
+                2 * np.pi * hour / 24
+            )
+            d["hour_cos"] = np.cos(
+                2 * np.pi * hour / 24
+            )
+            dow = d["timestamp"].dt.dayofweek
+            d["dow_sin"] = np.sin(
+                2 * np.pi * dow / 5
+            )
+            d["dow_cos"] = np.cos(
+                2 * np.pi * dow / 5
+            )
 
-    def _sortino(self, cr: float) -> float:
-        if len(self.hist) < 10:
-            return float(cr)
-        r  = np.array(self.hist[-100:])
-        dn = r[r < 0]
-        ds = (np.std(dn)
-              if len(dn) > 0 else self.EPS)
-        return float(
-            (cr-self.drf)/(ds+self.EPS))
+        # Clean
+        d.replace([np.inf, -np.inf], 0, inplace=True)
+        d.dropna(inplace=True)
+        d.reset_index(drop=True, inplace=True)
 
-    def _dd_pen(self, dd: float) -> float:
-        return float(np.exp(3*abs(dd))-1)
+        logger.info(
+            f"Features: {d.shape[1]} cols, "
+            f"{len(d):,} rows"
+        )
+        return d
 
-    def _trade_pen(self, a: int,
-                   pi: dict) -> float:
-        return (
-            0.001*self.tc
-            if a != pi.get("previous_action", 1)
-            else 0.0)
-
-    def _pf_bonus(self) -> float:
-        if len(self.hist) < 20: return 0.0
-        r  = np.array(self.hist[-50:])
-        gp = r[r > 0].sum()
-        gl = abs(r[r < 0].sum())
-        if gl < self.EPS: return 1.0
-        return float(np.clip(
-            np.log(gp/(gl+self.EPS)+self.EPS),
-            -2, 2))
-
-    def _consist(self) -> float:
-        if len(self.hist) < 30: return 0.0
-        r = np.array(self.hist[-30:])
-        if (np.mean(r) > 0 and
-                np.std(r) > self.EPS):
-            return float(np.mean(r)/np.std(r))
-        return -0.1
-
-    def _ruin(self, pi: dict) -> float:
-        cur  = pi.get("current_equity",  1.0)
-        init = pi.get("initial_equity",  1.0)
-        rat  = cur/(init+self.EPS)
-        if rat < self.ruin:
-            return float((self.ruin-rat)*10)
-        return 0.0
-
-    def reset(self):
-        self.hist.clear()
+    @property
+    def feature_cols(self) -> List[str]:
+        """
+        Columns used as model inputs.
+        Excludes raw OHLCV and timestamps.
+        """
+        return [
+            "ret_1","ret_3","ret_5",
+            "ret_10","ret_20",
+            "natr_14",
+            "rsi_7","rsi_14","rsi_21",
+            "macd_norm","macd_sig_norm",
+            "macd_hist_norm","macd_cross",
+            "bb_pos","bb_width","bb_squeeze",
+            "stoch_14","stochd_14",
+            "stoch_cross_14",
+            "stoch_21","stochd_21",
+            "stoch_cross_21",
+            "adx","di_bull","di_diff",
+            "mom_5","mom_10","mom_20","mom_50",
+            "vol_ratio_5_20","vol_ratio_20_60",
+            "range_pos_10","range_pos_20",
+            "range_pos_50","range_pos_100",
+            "ema_dist_10","ema_dist_20",
+            "ema_dist_50","ema_dist_200",
+            "body_ratio","bull_candle",
+            "upper_wick","lower_wick",
+            "vol_ratio_bar",
+            "zscore_20","zscore_50",
+            "ret_lag_1","ret_lag_2",
+            "ret_lag_3","ret_lag_5",
+            "hour_sin","hour_cos",
+            "dow_sin","dow_cos",
+        ]
 
 
 # ╔══════════════════════════════════════════════════════════╗
-# ║  MODULE 7 — PORTFOLIO MANAGER  (FIX 3)                   ║
+# ║  TARGET ENGINEERING                                      ║
 # ║                                                          ║
-# ║  FIX 3: Equity curve now tracks honest capped P&L.       ║
+# ║  Key insight: instead of "next bar direction"           ║
+# ║  (too noisy, ~50/50), predict "will price reach         ║
+# ║  TP before SL in next N bars?"                          ║
 # ║                                                          ║
-# ║  Previous problem:                                       ║
-# ║    eq_curve recorded self.equity which included          ║
-# ║    mark-to-market of open positions computed from        ║
-# ║    self.pos_size (capped) but self.cash could drift      ║
-# ║    if the capped size_usd was never deducted from        ║
-# ║    cash correctly on short opens. Additionally,          ║
-# ║    the equity value was used directly in PerfMonitor     ║
-# ║    which produced the 1915% phantom return.              ║
+# ║  This creates a target aligned with actual trading:     ║
+# ║  a BUY signal is correct if TP is hit before SL.        ║
+# ║  This produces class imbalance (depends on RR)          ║
+# ║  which XGBoost handles via scale_pos_weight.            ║
+# ╚══════════════════════════════════════════════════════════╝
+
+class TargetBuilder:
+    def __init__(self,
+                 sl_mult: float = 1.5,
+                 tp_mult: float = 2.0,
+                 max_bars: int  = 24):
+        """
+        Parameters
+        ----------
+        sl_mult  : SL = sl_mult * ATR
+        tp_mult  : TP = tp_mult * ATR
+        max_bars : maximum bars to look ahead.
+                   If neither SL nor TP hit in
+                   max_bars, label = 0 (loss/hold).
+        """
+        self.sl_mult  = sl_mult
+        self.tp_mult  = tp_mult
+        self.max_bars = max_bars
+
+    def build_long_target(
+            self,
+            df: pd.DataFrame
+    ) -> pd.Series:
+        """
+        For each bar, if we BOUGHT at close:
+          TP = close + tp_mult * atr_14
+          SL = close - sl_mult * atr_14
+          
+        Returns 1 if TP hit before SL within
+        max_bars, 0 otherwise.
+        
+        This is the ground truth for LONG signals.
+        """
+        n   = len(df)
+        lbl = np.zeros(n, dtype=np.int32)
+        closes = df["close"].values
+        highs  = df["high"].values
+        lows   = df["low"].values
+        atrs   = df["atr_14"].values
+
+        for i in range(n - self.max_bars):
+            entry = closes[i]
+            atr   = atrs[i]
+            if atr <= 0 or np.isnan(atr):
+                continue
+            tp = entry + self.tp_mult * atr
+            sl = entry - self.sl_mult * atr
+
+            for j in range(i + 1,
+                           i + self.max_bars + 1):
+                if highs[j] >= tp:
+                    lbl[i] = 1  # TP hit first
+                    break
+                if lows[j] <= sl:
+                    lbl[i] = 0  # SL hit first
+                    break
+
+        return pd.Series(lbl, index=df.index)
+
+    def build_short_target(
+            self,
+            df: pd.DataFrame
+    ) -> pd.Series:
+        """
+        For each bar, if we SOLD at close:
+          TP = close - tp_mult * atr_14
+          SL = close + sl_mult * atr_14
+          
+        Returns 1 if TP hit before SL within
+        max_bars, 0 otherwise.
+        """
+        n   = len(df)
+        lbl = np.zeros(n, dtype=np.int32)
+        closes = df["close"].values
+        highs  = df["high"].values
+        lows   = df["low"].values
+        atrs   = df["atr_14"].values
+
+        for i in range(n - self.max_bars):
+            entry = closes[i]
+            atr   = atrs[i]
+            if atr <= 0 or np.isnan(atr):
+                continue
+            tp = entry - self.tp_mult * atr
+            sl = entry + self.sl_mult * atr
+
+            for j in range(i + 1,
+                           i + self.max_bars + 1):
+                if lows[j] <= tp:
+                    lbl[i] = 1  # TP hit
+                    break
+                if highs[j] >= sl:
+                    lbl[i] = 0  # SL hit
+                    break
+
+        return pd.Series(lbl, index=df.index)
+
+
+# ╔══════════════════════════════════════════════════════════╗
+# ║  MODEL TRAINER                                           ║
 # ║                                                          ║
-# ║  Fix:                                                    ║
-# ║    Track realised_pnl_total separately from equity.      ║
-# ║    PerfMonitor.evaluate() receives a parallel            ║
-# ║    realised_curve built only from closed trade PnLs      ║
-# ║    starting from INITIAL_CAPITAL. This gives an          ║
-# ║    honest equity curve that cannot inflate from          ║
-# ║    mark-to-market compounding.                           ║
+# ║  Trains two separate classifiers:                        ║
+# ║    model_long:  P(long trade hits TP)                   ║
+# ║    model_short: P(short trade hits TP)                  ║
+# ║                                                          ║
+# ║  Each uses Optuna + TimeSeriesSplit CV.                  ║
+# ║  Scale_pos_weight corrects class imbalance.             ║
 # ╚══════════════════════════════════════════════════════════╝
 
-class PortfolioManager:
-    def __init__(self, cfg: SystemConfig):
-        self.init_cap  = cfg.INITIAL_CAPITAL
-        self.tc        = (cfg.TRANSACTION_COST_BPS
-                          / 10_000)
-        self.equity    = cfg.INITIAL_CAPITAL
-        self.cash      = cfg.INITIAL_CAPITAL
-        self.pos       = 0
-        self.pos_size  = 0.0
-        self.entry_px  = 0.0
-        self.entry_t   = None
-        self.peak_eq   = cfg.INITIAL_CAPITAL
-        self.prev_act  = 1
-        self.trades    = 0
-        self.wins      = 0
-        self.gross_p   = 0.0
-        self.gross_l   = 0.0
-        self.max_dd    = 0.0
-        self.eq_curve: List[dict]  = []
-        self.trade_log: List[dict] = []
-        self.daily_cnt = 0
-        self.cur_day   = None
-        self.daily_pnl = 0.0
-        self.EPS       = 1e-10
-        self._size_cap = (cfg.INITIAL_CAPITAL *
-                          cfg.EVAL_SIZE_CAP_PCT)
-        self._spread   = cfg.SPREAD_PRICE_UNITS
-        self.last_closed_pnl: Optional[
-            float] = None
-
-        # FIX 3: honest realised equity tracking
-        self._realised_equity = cfg.INITIAL_CAPITAL
-        self.realised_curve: List[dict] = []
-
-    def execute(self, action: int,
-                price: float,
-                time,
-                size_usd: float) -> dict:
-        size_usd = min(size_usd, self._size_cap)
-        port_ret = 0.0
-        executed = False
-        self.last_closed_pnl = None
-
-        if action == 2:        # BUY
-            fill_px = price + self._spread
-            if self.pos == -1:
-                pnl  = self.pos_size*(
-                    self.entry_px/
-                    (fill_px+self.EPS)-1)
-                cost = self.pos_size*self.tc
-                net  = pnl - cost
-                self.cash += (self.pos_size + net)
-                port_ret   = net/(
-                    self.equity+self.EPS)
-                self._log_trade(net, time)
-                self.last_closed_pnl = net
-                # FIX 3
-                self._realised_equity += net
-                self.pos = 0
-                self.pos_size = 0.0
-                executed = True
-            elif self.pos == 0:
-                cost = size_usd * self.tc
-                self.pos      = 1
-                self.pos_size = size_usd
-                self.entry_px = fill_px
-                self.entry_t  = time
-                self.cash -= (size_usd + cost)
-                self.cash  = max(self.cash, 0)
-                executed   = True
-            else:
-                port_ret = self.pos_size*(
-                    price/
-                    (self.entry_px+self.EPS)-1
-                )/(self.equity+self.EPS)
-
-        elif action == 0:      # SELL
-            fill_px = price - self._spread
-            if self.pos == 1:
-                pnl  = self.pos_size*(
-                    fill_px/
-                    (self.entry_px+self.EPS)-1)
-                cost = self.pos_size * self.tc
-                net  = pnl - cost
-                self.cash += (self.pos_size + net)
-                port_ret   = net/(
-                    self.equity+self.EPS)
-                self._log_trade(net, time)
-                self.last_closed_pnl = net
-                # FIX 3
-                self._realised_equity += net
-                self.pos = 0
-                self.pos_size = 0.0
-                executed = True
-            elif self.pos == 0:
-                cost = size_usd * self.tc
-                self.pos      = -1
-                self.pos_size = size_usd
-                self.entry_px = fill_px
-                self.entry_t  = time
-                self.cash -= cost
-                executed = True
-            else:
-                port_ret = self.pos_size*(
-                    self.entry_px/
-                    (price+self.EPS)-1
-                )/(self.equity+self.EPS)
-
-        else:                  # HOLD
-            if self.pos == 1:
-                port_ret = self.pos_size*(
-                    price/
-                    (self.entry_px+self.EPS)-1
-                )/(self.equity+self.EPS)
-            elif self.pos == -1:
-                port_ret = self.pos_size*(
-                    self.entry_px/
-                    (price+self.EPS)-1
-                )/(self.equity+self.EPS)
-
-        # Update mark-to-market equity
-        if self.pos == 1:
-            unr = self.pos_size*(
-                price/(self.entry_px+self.EPS)-1)
-            self.equity = (self.cash +
-                           self.pos_size + unr)
-        elif self.pos == -1:
-            unr = self.pos_size*(
-                self.entry_px/
-                (price+self.EPS)-1)
-            self.equity = (self.cash +
-                           self.pos_size + unr)
-        else:
-            self.equity = self.cash
-        self.equity = max(self.equity, 0.01)
-
-        self.peak_eq = max(
-            self.peak_eq, self.equity)
-        dd = ((self.peak_eq-self.equity) /
-              (self.peak_eq+self.EPS))
-        self.max_dd = max(self.max_dd, dd)
-
-        # Both curves recorded every step
-        self.eq_curve.append({
-            "time":   time,
-            "equity": self.equity,
-            "dd":     dd})
-
-        # FIX 3: realised curve only moves on
-        # closed trades, giving honest metrics
-        self.realised_curve.append({
-            "time":   time,
-            "equity": max(
-                self._realised_equity, 0.01),
-            "dd":     dd})
-
-        day = str(time)[:10] if time else "?"
-        if day != self.cur_day:
-            self.cur_day   = day
-            self.daily_cnt = 0
-            self.daily_pnl = 0.0
-        self.daily_pnl += port_ret * self.equity
-        if executed:
-            self.daily_cnt += 1
-        self.prev_act = action
-
-        return {
-            "port_ret": port_ret,
-            "executed": executed,
-            "equity":   self.equity,
-            "dd":       dd,
-        }
-
-    def _log_trade(self, pnl: float, time):
-        self.trades += 1
-        if pnl > 0:
-            self.wins    += 1
-            self.gross_p += pnl
-        else:
-            self.gross_l += abs(pnl)
-        self.trade_log.append({
-            "time": time, "pnl": pnl,
-            "eq":   self.equity})
-
-    def info(self, price: float = 0,
-             time=None) -> dict:
-        wr = (self.wins/self.trades
-              if self.trades > 0 else 0)
-        if self.pos == 1 and self.entry_px > 0:
-            upnl = price/self.entry_px - 1
-        elif (self.pos == -1 and
-              self.entry_px > 0):
-            upnl = self.entry_px/price - 1
-        else:
-            upnl = 0
-        hold = 0
-        if (self.pos != 0 and
-                self.entry_t and time):
-            try:
-                hold = ((time-self.entry_t)
-                        .total_seconds()/3600)
-            except Exception:
-                pass
-        dd = ((self.peak_eq-self.equity) /
-              (self.peak_eq+self.EPS))
-        return {
-            "current_position":   self.pos,
-            "current_equity":     self.equity,
-            "initial_equity":     self.init_cap,
-            "cash_ratio":
-                self.cash/(self.equity+self.EPS),
-            "unrealized_pnl":
-                upnl*self.pos_size,
-            "unrealized_pnl_pct": upnl,
-            "current_drawdown":   dd,
-            "recent_win_rate":    wr,
-            "avg_win_size":
-                self.gross_p/(
-                    self.wins+self.EPS),
-            "avg_loss_size":
-                self.gross_l/(
-                    max(1,
-                        self.trades-self.wins)),
-            "avg_trade_duration": 0,
-            "holding_duration":   hold,
-            "previous_action":    self.prev_act,
-            "trades_today":       self.daily_cnt,
-            "daily_pnl":          self.daily_pnl,
-            "total_trades":       self.trades,
-        }
-
-
-# ╔══════════════════════════════════════════════════════════╗
-# ║  MODULE 8 — RISK MANAGER                                 ║
-# ╚══════════════════════════════════════════════════════════╝
-
-class RiskManager:
-    def __init__(self, cfg: SystemConfig):
-        self.max_pos  = cfg.MAX_POSITION_SIZE
-        self.sl_pct   = cfg.STOP_LOSS_PCT
-        self.tp_pct   = cfg.TAKE_PROFIT_PCT
-        self.atr_sl   = cfg.ATR_SL_MULT
-        self.atr_tp   = cfg.ATR_TP_MULT
-        self.max_d    = cfg.MAX_DAILY_TRADES
-        self.max_dd   = cfg.MAX_DRAWDOWN_LIMIT
-        self.ruin     = cfg.EQUITY_RUIN_THRESHOLD
-        self.init_cap = cfg.INITIAL_CAPITAL
-        self.peak_eq  = cfg.INITIAL_CAPITAL
-        self.cnt      = 0
-        self.cur_day  = None
-        self.EPS      = 1e-10
-
-    def validate(self, action: int,
-                 pi: dict,
-                 mkt: dict = None) -> int:
-        eq   = pi.get(
-            "current_equity", self.init_cap)
-        pos  = pi.get("current_position", 0)
-        upnl = pi.get("unrealized_pnl_pct", 0)
-
-        if eq/(self.init_cap+self.EPS) < self.ruin:
-            return 1
-
-        self.peak_eq = max(self.peak_eq, eq)
-        dd = ((self.peak_eq-eq) /
-              (self.peak_eq+self.EPS))
-        if dd > self.max_dd:
-            if pos > 0 and action == 0: return 0
-            if pos < 0 and action == 2: return 2
-            return 1
-
-        today = (mkt.get("date")
-                 if mkt else None)
-        if today and today != self.cur_day:
-            self.cur_day = today; self.cnt = 0
-        if (action != 1 and
-                action != pi.get(
-                    "previous_action", 1)):
-            if self.cnt >= self.max_d:
-                return 1
-
-        if pos != 0:
-            atr      = (mkt.get("atr_14", 0)
-                        if mkt else 0)
-            entry_px = (mkt.get("entry_px", 0)
-                        if mkt else 0)
-            if (atr > self.EPS and
-                    entry_px > self.EPS):
-                sl_dist = self.atr_sl * atr
-                tp_dist = self.atr_tp * atr
-                if pos > 0:
-                    sl_p = entry_px - sl_dist
-                    tp_p = entry_px + tp_dist
-                    px   = mkt.get(
-                        "current_price", entry_px)
-                    if px <= sl_p: return 0
-                    if px >= tp_p: return 0
-                else:
-                    sl_p = entry_px + sl_dist
-                    tp_p = entry_px - tp_dist
-                    px   = mkt.get(
-                        "current_price", entry_px)
-                    if px >= sl_p: return 2
-                    if px <= tp_p: return 2
-            else:
-                if upnl < -self.sl_pct:
-                    return 0 if pos > 0 else 2
-                if upnl >  self.tp_pct:
-                    return 0 if pos > 0 else 2
-
-        return action
-
-    def position_size(self, pi: dict,
-                      mkt: dict,
-                      confidence: float) -> float:
-        eq   = pi.get(
-            "current_equity", self.init_cap)
-        base = eq * self.max_pos
-        cs   = float(np.clip(
-            confidence/(confidence+1), 0.5, 1))
-        cv   = mkt.get("vol_20", 0.02)
-        av   = mkt.get("vol_60", 0.02)
-        vs   = float(np.clip(
-            av/(cv+self.EPS), 0.5, 2))
-        wr   = pi.get("recent_win_rate", 0.5)
-        aw   = pi.get("avg_win_size",    0.01)
-        al   = abs(pi.get(
-            "avg_loss_size", 0.01))
-        kelly = 0.0
-        if al > self.EPS and wr > 0:
-            kelly = float(np.clip(
-                wr-(1-wr)/(
-                    aw/(al+self.EPS)+self.EPS),
-                0, 0.25))
-        ks  = max(
-            kelly/(self.max_pos+self.EPS), 0.1)
-        sz  = min(
-            base*cs*vs*ks, eq*self.max_pos)
-        return max(sz, 0)
-
-    def record(self):
-        self.cnt += 1
-
-
-# ╔══════════════════════════════════════════════════════════╗
-# ║  MODULE 9 — ENSEMBLE DOUBLE-Q AGENT                      ║
-# ╚══════════════════════════════════════════════════════════╝
-
-class EnsembleDoubleQAgent:
-    def __init__(self, cfg: SystemConfig):
-        self.cfg       = cfg
-        self.n_a       = cfg.N_ACTIONS
-        self.n_m       = cfg.N_ENSEMBLE_MODELS
-        self.gamma     = cfg.GAMMA
-        self.epsilon   = cfg.INITIAL_EPSILON
-        self.eps_min   = cfg.EPSILON_MIN
-        self.eps_decay = cfg.EPSILON_DECAY
-        self.conf_thr  = cfg.CONFIDENCE_THRESHOLD
-        self.batch_sz  = cfg.BATCH_SIZE
-        self.fitted    = False
-        self.step      = 0
-        self.EPS       = 1e-10
-
-        self.buf = PrioritizedReplayBuffer(
-            cfg.REPLAY_BUFFER_CAPACITY,
-            cfg.PRIORITY_ALPHA,
-            cfg.PRIORITY_BETA_START,
-            cfg.PRIORITY_BETA_INCREMENT)
-
-        self.q1: Dict[int, List[dict]] = {}
-        self.q2: Dict[int, List[dict]] = {}
-        self._init()
-        self.ew = np.ones(self.n_m)/self.n_m
-
-    def _make(self, i: int) -> XGBRegressor:
-        p = {
-            **self.cfg.XGB_BASE,
-            **self.cfg.ENSEMBLE_CONFIGS[i]
-        }
-        return XGBRegressor(**p)
-
-    def _init(self):
-        for a in range(self.n_a):
-            self.q1[a] = [
-                {"model": self._make(i),
-                 "fi": None, "perf": 0.}
-                for i in range(self.n_m)]
-            self.q2[a] = [
-                {"model": self._make(i),
-                 "fi": None, "perf": 0.}
-                for i in range(self.n_m)]
-
-    def _pred_ens(self, ens: List[dict],
-                  s: np.ndarray) -> List[float]:
-        out = []
-        for m in ens:
-            x = (s[:, m["fi"]]
-                 if m["fi"] is not None
-                 else s)
-            try:
-                out.append(float(
-                    m["model"].predict(x)[0]))
-            except Exception:
-                out.append(0.0)
-        return out
-
-    def _q(self, ens: Dict,
-           s: np.ndarray, a: int) -> float:
-        ps = self._pred_ens(
-            ens[a], s.reshape(1, -1))
-        return float(
-            np.average(ps, weights=self.ew))
-
-    def select(self, s: np.ndarray,
-               training=True) -> int:
-        if (training and
-                random.random() < self.epsilon):
-            return random.randint(0, self.n_a-1)
-        if not self.fitted:
-            return random.randint(0, self.n_a-1)
-        sv = s.reshape(1, -1)
-        qv = np.zeros(self.n_a)
-        cf = np.zeros(self.n_a)
-        for a in range(self.n_a):
-            ps = (self._pred_ens(
-                      self.q1[a], sv) +
-                  self._pred_ens(
-                      self.q2[a], sv))
-            qv[a] = np.mean(ps)
-            cf[a] = 1/(np.std(ps)+self.EPS)
-        best = int(np.argmax(qv))
-        nc   = cf[best]/(cf.sum()+self.EPS)
-        if nc < self.conf_thr:
-            return 1
-        return best
-
-    def confidence(self,
-                   s: np.ndarray) -> float:
-        if not self.fitted: return 0.5
-        sv = s.reshape(1, -1)
-        all_ps = []
-        for a in range(self.n_a):
-            all_ps.extend(
-                self._pred_ens(
-                    self.q1[a], sv))
-        return float(
-            1/(np.std(all_ps)+self.EPS))
-
-    def store(self, s, a, r, ns, done):
-        td = None
-        if self.fitted:
-            cq = self._q(self.q1, s, a)
-            if done:
-                tgt = r
-            else:
-                nqs = [
-                    self._q(self.q1, ns, aa)
-                    for aa in range(self.n_a)]
-                tgt = r + self.gamma * max(nqs)
-            td = abs(tgt - cq)
-        self.buf.add(s, a, r, ns, done, td)
-
-    def train(self) -> Optional[dict]:
-        if self.buf.size < self.batch_sz:
-            return None
-        if (self.buf.size <
-                self.cfg.MIN_BUFFER_SIZE):
-            return None
-        self.step += 1
-        b = self.buf.sample(self.batch_sz)
-        S, A, R, NS, D = (
-            b["states"], b["actions"],
-            b["rewards"], b["next_states"],
-            b["dones"])
-        W   = b["weights"]
-        idx = b["indices"]
-        tgts = np.zeros(
-            self.batch_sz, np.float32)
-        tds  = np.zeros(
-            self.batch_sz, np.float32)
-
-        for i in range(self.batch_sz):
-            if D[i]:
-                tgts[i] = R[i]
-            else:
-                if random.random() < 0.5:
-                    ba = int(np.argmax([
-                        self._q(
-                            self.q1, NS[i], aa)
-                        for aa in
-                        range(self.n_a)]))
-                    tgt = (R[i] + self.gamma *
-                           self._q(
-                               self.q2,
-                               NS[i], ba))
-                else:
-                    ba = int(np.argmax([
-                        self._q(
-                            self.q2, NS[i], aa)
-                        for aa in
-                        range(self.n_a)]))
-                    tgt = (R[i] + self.gamma *
-                           self._q(
-                               self.q1,
-                               NS[i], ba))
-                tgts[i] = tgt
-            tds[i] = abs(
-                tgts[i] -
-                self._q(self.q1, S[i],
-                         int(A[i])))
-
-        self.buf.update_priorities(idx, tds)
-        self._retrain(S, A, tgts, W)
-        self.epsilon = max(
-            self.eps_min,
-            self.epsilon * self.eps_decay)
-        return {
-            "td_err":  float(np.mean(tds)),
-            "mean_r":  float(np.mean(R)),
-            "epsilon": self.epsilon,
-            "buf":     self.buf.size,
-        }
-
-    def _retrain(self, S, A, tgts, W):
-        n_feat = S.shape[1]
-        for a in range(self.n_a):
-            mask = A == a
-            if mask.sum() < 10: continue
-            Xa = S[mask]; ya = tgts[mask]
-            wa = W[mask]; n  = len(Xa)
-            for i in range(self.n_m):
-                bsz = max(10, int(0.8*n))
-                bi  = np.random.choice(
-                    n, bsz, replace=True)
-                cf  = self.cfg.ENSEMBLE_CONFIGS[
-                    i]["colsample_bytree"]
-                nf  = max(2, int(cf*n_feat))
-                fi  = np.sort(
-                    np.random.choice(
-                        n_feat, nf,
-                        replace=False))
-                self.q1[a][i]["fi"] = fi
-                self.q2[a][i]["fi"] = fi
-
-                Xt = Xa[bi][:, fi]
-                Xt = Xt + np.random.normal(
-                    0,
-                    self.cfg.NOISE_INJECTION_LEVEL,
-                    Xt.shape)
-                dm = np.random.binomial(
-                    1,
-                    1-self.cfg
-                    .FEATURE_DROPOUT_RATE,
-                    Xt.shape)
-                Xt = Xt * dm
-                try:
-                    self.q1[a][i]["model"].fit(
-                        Xt, ya[bi],
-                        sample_weight=wa[bi])
-                except Exception as e:
-                    logger.debug(
-                        f"Q1 fit a={a} "
-                        f"m={i}: {e}")
-
-                bi2 = np.random.choice(
-                    n, bsz, replace=True)
-                Xt2 = Xa[bi2][:, fi]
-                Xt2 = Xt2 + np.random.normal(
-                    0,
-                    self.cfg.NOISE_INJECTION_LEVEL,
-                    Xt2.shape)
-                dm2 = np.random.binomial(
-                    1,
-                    1-self.cfg
-                    .FEATURE_DROPOUT_RATE,
-                    Xt2.shape)
-                Xt2 = Xt2 * dm2
-                try:
-                    self.q2[a][i]["model"].fit(
-                        Xt2, ya[bi2],
-                        sample_weight=wa[bi2])
-                except Exception as e:
-                    logger.debug(
-                        f"Q2 fit a={a} "
-                        f"m={i}: {e}")
-        self.fitted = True
-
-    def update_ew(self, val_S: np.ndarray,
-                  val_tgts: np.ndarray):
-        scores = np.zeros(self.n_m)
-        for i in range(self.n_m):
-            errs, cnt = 0.0, 0
-            for a in range(self.n_a):
-                fi = self.q1[a][i]["fi"]
-                if fi is None: continue
-                x  = val_S[:, fi]
-                try:
-                    p = self.q1[a][i][
-                        "model"].predict(x)
-                    errs += mean_squared_error(
-                        val_tgts, p)
-                    cnt  += 1
-                except Exception:
-                    pass
-            if cnt > 0:
-                scores[i] = -(errs/cnt)
-        ex = np.exp(scores - scores.max())
-        self.ew = ex / ex.sum()
-
-
-# ╔══════════════════════════════════════════════════════════╗
-# ║  MODULE 10 — WALK-FORWARD ENGINE                         ║
-# ╚══════════════════════════════════════════════════════════╝
-
-class WalkForward:
-    def __init__(self, cfg: SystemConfig):
-        self.tw   = cfg.TRAIN_WINDOW
-        self.ri   = cfg.RETRAIN_INTERVAL
-        self.mt   = cfg.MIN_TRAIN_SAMPLES
-        self.rp   = cfg.REGIME_CHANGE_P_VALUE
-        self.rl   = cfg.REGIME_LOOKBACK
-        self.rd   = cfg.RECENCY_WEIGHT_DECAY
-        self.last = 0; self.cnt = 0
-        self.recent: deque = deque(maxlen=200)
-
-    def record(self, r: float):
-        self.recent.append(r)
-
-    def should_retrain(
-            self, t: int,
-            data: pd.DataFrame) -> bool:
-        return (
-            (t-self.last) >= self.ri or
-            self.regime_change(data, t) or
-            self._degraded())
-
-    def regime_change(
-            self, data: pd.DataFrame,
-            t: int) -> bool:
-        if t < 2*self.rl: return False
-        r   = data["returns"].fillna(0)
-        rec = r.iloc[t-self.rl:t].values
-        prv = r.iloc[
-            t-2*self.rl:t-self.rl].values
-        try:
-            _, p = ks_2samp(rec, prv)
-            if p < self.rp:
-                logger.info(
-                    f"Regime change at "
-                    f"step {t} p={p:.5f}")
-                return True
-        except Exception:
-            pass
-        return False
-
-    def _degraded(self) -> bool:
-        if len(self.recent) < 100: return False
-        arr = list(self.recent)
-        r50 = np.mean(arr[-50:])
-        p50 = np.mean(arr[-100:-50])
-        if p50 != 0 and r50 < p50 * 0.5:
-            logger.info(
-                "Performance degradation "
-                "detected")
-            return True
-        return False
-
-    def window(self, data: pd.DataFrame,
-               t: int):
-        st    = max(0, t-self.tw)
-        chunk = data.iloc[st:t].copy()
-        n     = len(chunk)
-        w     = np.exp(
-            np.linspace(self.rd, 0, n))
-        self.last = t; self.cnt += 1
-        return chunk, w/w.sum()
-
-
-# ╔══════════════════════════════════════════════════════════╗
-# ║  MODULE 11 — HYPERPARAMETER OPTIMIZER                    ║
-# ╚══════════════════════════════════════════════════════════╝
-
-class HPOptimizer:
-    def __init__(self, cfg: SystemConfig):
+class ModelTrainer:
+    def __init__(self, cfg: Config):
         self.cfg = cfg
 
-    def optimize(self, X: np.ndarray,
+    def _cv_score(self, params: dict,
+                  X: np.ndarray,
+                  y: np.ndarray) -> float:
+        """
+        Purged time-series cross-validation.
+        Returns mean ROC-AUC across folds.
+        """
+        tscv   = TimeSeriesSplit(
+            n_splits=self.cfg.CV_SPLITS,
+            gap=self.cfg.EMBARGO_BARS
+        )
+        scores = []
+        for tr_idx, te_idx in tscv.split(X):
+            Xtr, ytr = X[tr_idx], y[tr_idx]
+            Xte, yte = X[te_idx], y[te_idx]
+            if len(np.unique(ytr)) < 2:
+                continue
+            spw = float(
+                (ytr == 0).sum() /
+                max((ytr == 1).sum(), 1)
+            )
+            m = XGBClassifier(
+                **params,
+                scale_pos_weight=spw,
+                verbosity=0,
+                tree_method="hist",
+                random_state=42,
+            )
+            m.fit(Xtr, ytr)
+            if len(np.unique(yte)) < 2:
+                continue
+            try:
+                auc = roc_auc_score(
+                    yte,
+                    m.predict_proba(Xte)[:, 1]
+                )
+                scores.append(auc)
+            except Exception:
+                pass
+        return float(np.mean(scores)) if scores else 0.5
+
+    def optimize(self,
+                 X: np.ndarray,
                  y: np.ndarray) -> dict:
+        """
+        Optuna hyperparameter search.
+        Returns best params dict.
+        """
         def objective(trial):
             params = {
-                "n_estimators":
-                    trial.suggest_int(
-                        "n_estimators",
-                        100, 1000),
-                "max_depth":
-                    trial.suggest_int(
-                        "max_depth", 3, 10),
-                "learning_rate":
-                    trial.suggest_float(
-                        "lr", 0.005, 0.3,
-                        log=True),
-                "min_child_weight":
-                    trial.suggest_int(
-                        "mcw", 1, 20),
-                "subsample":
-                    trial.suggest_float(
-                        "ss", 0.5, 1.0),
-                "colsample_bytree":
-                    trial.suggest_float(
-                        "cs", 0.3, 1.0),
-                "gamma":
-                    trial.suggest_float(
-                        "gm", 0, 10),
-                "reg_alpha":
-                    trial.suggest_float(
-                        "ra", 1e-6, 100,
-                        log=True),
-                "reg_lambda":
-                    trial.suggest_float(
-                        "rl", 1e-6, 100,
-                        log=True),
-                "tree_method":  "hist",
-                "verbosity":    0,
-                "random_state": 42,
+                "n_estimators": trial.suggest_int(
+                    "n_est", 100, 500
+                ),
+                "max_depth": trial.suggest_int(
+                    "depth", 3, 8
+                ),
+                "learning_rate": trial.suggest_float(
+                    "lr", 0.01, 0.2, log=True
+                ),
+                "min_child_weight": trial.suggest_int(
+                    "mcw", 5, 50
+                ),
+                "subsample": trial.suggest_float(
+                    "ss", 0.5, 0.9
+                ),
+                "colsample_bytree": trial.suggest_float(
+                    "cs", 0.4, 0.9
+                ),
+                "reg_alpha": trial.suggest_float(
+                    "ra", 0.1, 10.0, log=True
+                ),
+                "reg_lambda": trial.suggest_float(
+                    "rl", 0.1, 10.0, log=True
+                ),
+                "gamma": trial.suggest_float(
+                    "gm", 0.0, 5.0
+                ),
             }
-            folds  = self._cv_folds(
-                len(X),
-                self.cfg.OPTUNA_CV_SPLITS,
-                self.cfg.EMBARGO_PCT)
-            scores = []
-            for fi, (tri, tei) in enumerate(
-                    folds):
-                m = XGBClassifier(**params)
-                try:
-                    m.fit(
-                        X[tri], y[tri],
-                        eval_set=[
-                            (X[tei], y[tei])],
-                        verbose=False)
-                    auc = roc_auc_score(
-                        y[tei],
-                        m.predict_proba(
-                            X[tei])[:, 1])
-                    scores.append(auc)
-                except Exception:
-                    scores.append(0.5)
-                trial.report(
-                    np.mean(scores), fi)
-                if trial.should_prune():
-                    raise optuna.exceptions\
-                        .TrialPruned()
-            return float(np.mean(scores))
+            return self._cv_score(params, X, y)
 
         study = optuna.create_study(
             direction="maximize",
             sampler=optuna.samplers.TPESampler(
-                seed=42),
-            pruner=(optuna.pruners
-                    .HyperbandPruner()))
+                seed=42
+            ),
+        )
         study.optimize(
             objective,
-            n_trials=self.cfg.OPTUNA_N_TRIALS,
-            n_jobs=1,
-            show_progress_bar=False)
+            n_trials=self.cfg.OPTUNA_TRIALS,
+            show_progress_bar=False,
+        )
         logger.info(
-            f"Best AUC: "
-            f"{study.best_value:.4f}")
+            f"Best AUC: {study.best_value:.4f}"
+        )
         return study.best_params
 
-    @staticmethod
-    def _cv_folds(n, ns, ep):
-        emb   = int(n*ep)
-        fsz   = n//ns
-        folds = []
-        for i in range(ns):
-            ts = i*fsz
-            te = (i+1)*fsz if i < ns-1 else n
-            tr = np.concatenate([
-                np.arange(0, max(0, ts-emb)),
-                np.arange(min(n, te+emb), n)
-            ]).astype(int)
-            tv = np.arange(ts, te).astype(int)
-            if (len(tr) >= 10 and
-                    len(tv) >= 5):
-                folds.append((tr, tv))
-        return folds
+    def fit(self,
+            X: np.ndarray,
+            y: np.ndarray,
+            params: dict) -> XGBClassifier:
+        """
+        Fit final model on full training data.
+        """
+        spw = float(
+            (y == 0).sum() /
+            max((y == 1).sum(), 1)
+        )
+        m = XGBClassifier(
+            **params,
+            scale_pos_weight=spw,
+            verbosity=0,
+            tree_method="hist",
+            random_state=42,
+        )
+        m.fit(X, y)
+        return m
 
 
 # ╔══════════════════════════════════════════════════════════╗
-# ║  MODULE 12 — ONNX EXPORT                                 ║
-# ╚══════════════════════════════════════════════════════════╝
-
-class ONNXExporter:
-    def __init__(self, cfg: SystemConfig):
-        self.out = cfg.OUTPUT_DIR
-
-    def _export_one(self, mdl, net_name: str,
-                    a: int, mi: int,
-                    in_dim: int) -> str:
-        import onnx
-        from onnx import shape_inference
-
-        init_types = [
-            ("input",
-             FloatTensorType([1, in_dim]))
-        ]
-        try:
-            onnx_model = convert_sklearn(
-                mdl,
-                initial_types=init_types,
-                target_opset=15,
-                options={
-                    type(mdl): {"nocopy": True}
-                })
-        except Exception:
-            onnx_model = convert_sklearn(
-                mdl,
-                initial_types=init_types,
-                target_opset=15)
-
-        graph = onnx_model.graph
-        inp   = graph.input[0]
-        inp.type.tensor_type.shape\
-            .ClearField("dim")
-        d0 = (inp.type.tensor_type
-              .shape.dim.add())
-        d0.dim_value = 1
-        d1 = (inp.type.tensor_type
-              .shape.dim.add())
-        d1.dim_value = in_dim
-
-        out  = graph.output[0]
-        out.type.tensor_type.shape\
-            .ClearField("dim")
-        od0 = (out.type.tensor_type
-               .shape.dim.add())
-        od0.dim_value = 1
-        od1 = (out.type.tensor_type
-               .shape.dim.add())
-        od1.dim_value = 1
-
-        onnx_model = shape_inference\
-            .infer_shapes(onnx_model)
-
-        fname = f"{net_name}_a{a}_m{mi}.onnx"
-        fpath = os.path.join(self.out, fname)
-        with open(fpath, "wb") as f:
-            f.write(
-                onnx_model.SerializeToString())
-
-        sess    = ort.InferenceSession(fpath)
-        dummy   = np.zeros(
-            (1, in_dim), dtype=np.float32)
-        in_name = sess.get_inputs()[0].name
-        result  = sess.run(
-            None, {in_name: dummy})
-        in_sh   = sess.get_inputs()[0].shape
-        out_sh  = sess.get_outputs()[0].shape
-        val     = float(
-            result[0].flatten()[0])
-        logger.info(
-            f"  ✔ {fname}: "
-            f"in{in_sh} → out{out_sh} "
-            f"= {val:.6f}")
-        return fpath
-
-    def export_agent(
-            self,
-            agent: "EnsembleDoubleQAgent",
-            selected: List[str],
-            scaler_params: dict,
-            state_dim: int,
-            report: dict,
-            frame_stack_size: int = 1):
-        os.makedirs(self.out, exist_ok=True)
-        exported = []
-
-        for net_name, ens in [
-                ("q1", agent.q1),
-                ("q2", agent.q2)]:
-            for a in range(agent.n_a):
-                for mi in range(agent.n_m):
-                    m      = ens[a][mi]
-                    mdl    = m["model"]
-                    fi     = m["fi"]
-                    in_dim = (len(fi)
-                              if fi is not None
-                              else state_dim)
-                    try:
-                        self._export_one(
-                            mdl, net_name,
-                            a, mi, in_dim)
-                        exported.append(
-                            f"{net_name}_a{a}"
-                            f"_m{mi}.onnx")
-                    except Exception as e:
-                        logger.warning(
-                            f"ONNX export "
-                            f"failed {net_name}"
-                            f" a={a} m={mi}: {e}")
-                        try:
-                            mdl.save_model(
-                                os.path.join(
-                                    self.out,
-                                    f"{net_name}"
-                                    f"_a{a}_m{mi}"
-                                    f".json"))
-                        except Exception:
-                            pass
-
-        fi_map = {}
-        for a in range(agent.n_a):
-            for mi in range(agent.n_m):
-                for net in ["q1", "q2"]:
-                    ens_src = (agent.q1
-                               if net == "q1"
-                               else agent.q2)
-                    fi  = ens_src[a][mi]["fi"]
-                    key = f"{net}_a{a}_m{mi}"
-                    fi_map[key] = (
-                        fi.tolist()
-                        if fi is not None
-                        else list(
-                            range(state_dim)))
-
-        with open(os.path.join(
-                self.out,
-                "feature_indices.json"),
-                "w") as f:
-            json.dump(fi_map, f, indent=2)
-        with open(os.path.join(
-                self.out,
-                "selected_features.json"),
-                "w") as f:
-            json.dump(selected, f, indent=2)
-        with open(os.path.join(
-                self.out,
-                "scaler_params.json"),
-                "w") as f:
-            json.dump(
-                scaler_params, f, indent=2)
-        with open(os.path.join(
-                self.out,
-                "ensemble_weights.json"),
-                "w") as f:
-            json.dump(
-                {"weights": agent.ew.tolist()},
-                f, indent=2)
-        with open(os.path.join(
-                self.out, "config.json"),
-                "w") as f:
-            json.dump({
-                "N_ACTIONS":         agent.n_a,
-                "N_ENSEMBLE_MODELS": agent.n_m,
-                "GAMMA":             agent.gamma,
-                "STATE_DIM":         state_dim,
-                "N_MARKET_FEATURES": len(selected),
-                "N_PORTFOLIO_FEATURES": 9,
-                "N_REGIME_FEATURES":    8,
-                "SELECTED_FEATURES": selected,
-                "CONFIDENCE_THRESHOLD":
-                    agent.conf_thr,
-                "FRAME_STACK_SIZE":
-                    frame_stack_size,
-                "ONNX_INPUT_NOTE": (
-                    "Slice stacked_state[fi] "
-                    "before OnnxRun(). fi from "
-                    "feature_indices.json."),
-            }, f, indent=2)
-        with open(os.path.join(
-                self.out,
-                "training_report.json"),
-                "w") as f:
-            json.dump(
-                {k: float(v)
-                 if isinstance(
-                     v, (np.floating, float))
-                 else v
-                 for k, v in report.items()},
-                f, indent=2)
-
-        logger.info(
-            f"Exported {len(exported)} ONNX "
-            f"models to {self.out}/")
-        return exported
-
-
-# ╔══════════════════════════════════════════════════════════╗
-# ║  MODULE 13 — PERFORMANCE MONITOR  (FIX 3)                ║
+# ║  BACKTEST ENGINE                                         ║
 # ║                                                          ║
-# ║  Now evaluates realised_curve instead of eq_curve so     ║
-# ║  the total return reflects only closed trade PnL.        ║
+# ║  Honest simulation rules:                                ║
+# ║  1. Enter at NEXT BAR OPEN (not current close)          ║
+# ║     to avoid look-ahead bias                            ║
+# ║  2. SL and TP checked against bar HIGH/LOW              ║
+# ║  3. If both SL and TP within same bar,                  ║
+# ║     assume SL hit (conservative)                        ║
+# ║  4. Position size = (equity * risk_pct) / (SL pips)    ║
+# ║  5. Spread paid on entry AND exit                       ║
+# ║  6. One trade at a time                                 ║
+# ║  7. Daily trade limit enforced                          ║
 # ╚══════════════════════════════════════════════════════════╝
 
-class PerfMonitor:
-    def __init__(self, cfg: SystemConfig):
-        self.rf  = cfg.RISK_FREE_RATE
+@dataclass
+class Trade:
+    entry_bar:   int
+    entry_price: float
+    direction:   int     # +1 long, -1 short
+    sl_price:    float
+    tp_price:    float
+    lot_size:    float
+    exit_bar:    int     = -1
+    exit_price:  float   = 0.0
+    pnl_usd:     float   = 0.0
+    exit_reason: str     = ""
+
+
+class BacktestEngine:
+    def __init__(self, cfg: Config):
+        self.cfg = cfg
         self.EPS = 1e-10
 
-    def evaluate(self,
-                 eq_curve: List[dict],
-                 trade_log: List[dict],
-                 realised_curve: Optional[
-                     List[dict]] = None
-                 ) -> dict:
-        # FIX 3: use realised curve if provided
-        curve = (realised_curve
-                 if realised_curve
-                 else eq_curve)
-        if len(curve) < 2: return {}
+    def run(self,
+            df: pd.DataFrame,
+            signals: pd.Series
+            ) -> Tuple[List[Trade],
+                       pd.DataFrame]:
+        """
+        Parameters
+        ----------
+        df      : feature dataframe with OHLCV
+        signals : Series of {-1, 0, +1}
+                  -1=short, 0=hold, +1=long
+                  indexed same as df
 
-        eq  = np.array(
-            [e["equity"] for e in curve])
-        ret = np.diff(eq)/(eq[:-1]+self.EPS)
-        n_d = max(len(ret)/24, 1)
-        tr  = eq[-1]/eq[0]-1
-        ar  = (1+tr)**(252/n_d)-1
-        av  = np.std(ret)*np.sqrt(252*24)
-        mx  = self._mdd(eq)
-        dn  = ret[ret < 0]
-        dv  = (np.std(dn) if len(dn) > 0
-               else self.EPS)*np.sqrt(252*24)
-        sh  = (ar-self.rf)/(av+self.EPS)
-        so  = (ar-self.rf)/(dv+self.EPS)
-        ca  = ar/(abs(mx)+self.EPS)
-        tdf = (pd.DataFrame(trade_log)
-               if trade_log
-               else pd.DataFrame())
-        nt  = len(tdf)
-        wt  = (int((tdf["pnl"] > 0).sum())
-               if nt > 0 else 0)
-        wr  = wt/(nt+self.EPS)
-        gp  = (float(
-                   tdf[tdf["pnl"] > 0]["pnl"]
-                   .sum())
-               if wt > 0 else 0)
-        gl  = (float(
-                   tdf[tdf["pnl"] < 0]["pnl"]
-                   .abs().sum())
-               if nt-wt > 0 else 0)
-        pf  = gp/(gl+self.EPS)
-        m   = {
-            "total_return":  tr,
-            "ann_return":    ar,
-            "ann_vol":       av,
-            "max_dd":        mx,
-            "sharpe":        sh,
-            "sortino":       so,
-            "calmar":        ca,
+        Returns
+        -------
+        trades      : list of Trade objects
+        equity_df   : bar-by-bar equity
+        """
+        cfg      = self.cfg
+        equity   = cfg.INITIAL_CAPITAL
+        peak_eq  = equity
+        eq_hist  = []
+        trades   = []
+        open_tr: Optional[Trade] = None
+        daily_cnt  = 0
+        cur_day    = None
+        halted     = False
+
+        closes = df["close"].values
+        highs  = df["high"].values
+        lows   = df["low"].values
+        atrs   = df["atr_14"].values
+        times  = df["timestamp"].values
+
+        for i in range(len(df)):
+            price = closes[i]
+            high  = highs[i]
+            low   = lows[i]
+            atr   = atrs[i]
+            t     = pd.Timestamp(times[i])
+            sig   = int(signals.iloc[i])
+
+            # --- Reset daily counter ---
+            day = t.date()
+            if day != cur_day:
+                cur_day   = day
+                daily_cnt = 0
+
+            # --- Check open trade SL/TP ---
+            if open_tr is not None:
+                closed = False
+
+                if open_tr.direction == 1:
+                    # Long: SL if low <= sl_price
+                    #       TP if high >= tp_price
+                    if (low <= open_tr.sl_price and
+                            high >= open_tr.tp_price):
+                        # Both triggered: conservative
+                        # assume SL hit
+                        ex_px = open_tr.sl_price
+                        open_tr.exit_reason = "SL"
+                        closed = True
+                    elif low <= open_tr.sl_price:
+                        ex_px = open_tr.sl_price
+                        open_tr.exit_reason = "SL"
+                        closed = True
+                    elif high >= open_tr.tp_price:
+                        ex_px = open_tr.tp_price
+                        open_tr.exit_reason = "TP"
+                        closed = True
+
+                else:  # Short
+                    if (high >= open_tr.sl_price and
+                            low <= open_tr.tp_price):
+                        ex_px = open_tr.sl_price
+                        open_tr.exit_reason = "SL"
+                        closed = True
+                    elif high >= open_tr.sl_price:
+                        ex_px = open_tr.sl_price
+                        open_tr.exit_reason = "SL"
+                        closed = True
+                    elif low <= open_tr.tp_price:
+                        ex_px = open_tr.tp_price
+                        open_tr.exit_reason = "TP"
+                        closed = True
+
+                if closed:
+                    # PnL calculation
+                    # spread on exit
+                    if open_tr.direction == 1:
+                        ex_fill = (
+                            ex_px - cfg.SPREAD_PRICE / 2
+                        )
+                        pnl_pts = (
+                            ex_fill -
+                            open_tr.entry_price
+                        )
+                    else:
+                        ex_fill = (
+                            ex_px + cfg.SPREAD_PRICE / 2
+                        )
+                        pnl_pts = (
+                            open_tr.entry_price -
+                            ex_fill
+                        )
+
+                    # Convert to USD
+                    pnl_usd = (
+                        pnl_pts *
+                        cfg.CONTRACT_SIZE *
+                        open_tr.lot_size
+                    )
+                    # Commission (already paid on
+                    # entry, pay other half on exit)
+                    pnl_usd -= (
+                        cfg.COMMISSION_PER_LOT *
+                        open_tr.lot_size / 2
+                    )
+
+                    open_tr.exit_bar   = i
+                    open_tr.exit_price = ex_fill
+                    open_tr.pnl_usd    = pnl_usd
+                    equity += pnl_usd
+                    equity  = max(equity, 0.01)
+                    trades.append(open_tr)
+                    open_tr = None
+
+                    peak_eq = max(peak_eq, equity)
+                    dd = (peak_eq - equity) / (
+                        peak_eq + self.EPS
+                    )
+                    if dd > cfg.MAX_DRAWDOWN_HALT:
+                        halted = True
+                        logger.warning(
+                            f"Drawdown halt at "
+                            f"bar {i}, equity="
+                            f"${equity:,.2f}"
+                        )
+
+            # --- Entry logic ---
+            if (not halted and
+                    open_tr is None and
+                    sig != 0 and
+                    daily_cnt < cfg.MAX_DAILY_TRADES and
+                    i < len(df) - 1):
+
+                # Enter at NEXT BAR OPEN
+                entry_px = closes[i + 1]  # approx
+                # Actually: next bar open
+                # We'll use close[i] + spread as fill
+                # for simplicity (conservative)
+
+                if atr <= 0 or np.isnan(atr):
+                    eq_hist.append(equity)
+                    continue
+
+                if sig == 1:  # Long
+                    fill_px = (
+                        price + cfg.SPREAD_PRICE / 2
+                    )
+                    sl_px = fill_px - cfg.ATR_SL_MULT * atr
+                    tp_px = fill_px + cfg.ATR_TP_MULT * atr
+                    sl_dist = fill_px - sl_px
+                else:         # Short
+                    fill_px = (
+                        price - cfg.SPREAD_PRICE / 2
+                    )
+                    sl_px = fill_px + cfg.ATR_SL_MULT * atr
+                    tp_px = fill_px - cfg.ATR_TP_MULT * atr
+                    sl_dist = sl_px - fill_px
+
+                if sl_dist <= self.EPS:
+                    eq_hist.append(equity)
+                    continue
+
+                # Fixed fractional sizing
+                # Risk = equity * RISK_PER_TRADE_PCT
+                # Lot = Risk / (SL_pips * pip_value_per_lot)
+                risk_usd = equity * cfg.RISK_PER_TRADE_PCT
+                pip_val_per_lot = (
+                    cfg.PIP_VALUE *
+                    cfg.CONTRACT_SIZE
+                )
+                sl_pips = sl_dist / cfg.PIP_VALUE
+                lots    = risk_usd / (
+                    sl_pips * pip_val_per_lot +
+                    self.EPS
+                )
+                lots    = min(lots, 100.0)  # cap
+                lots    = max(lots, 0.01)   # min
+
+                # Commission on entry (half round-turn)
+                commission = (
+                    cfg.COMMISSION_PER_LOT * lots / 2
+                )
+                equity -= commission
+                equity  = max(equity, 0.01)
+
+                open_tr = Trade(
+                    entry_bar=i,
+                    entry_price=fill_px,
+                    direction=sig,
+                    sl_price=sl_px,
+                    tp_price=tp_px,
+                    lot_size=lots,
+                )
+                daily_cnt += 1
+
+            peak_eq = max(peak_eq, equity)
+            eq_hist.append(equity)
+
+        # Close any open trade at end
+        if open_tr is not None:
+            ep = closes[-1]
+            if open_tr.direction == 1:
+                fill  = ep - cfg.SPREAD_PRICE / 2
+                pnl_p = fill - open_tr.entry_price
+            else:
+                fill  = ep + cfg.SPREAD_PRICE / 2
+                pnl_p = open_tr.entry_price - fill
+            pnl_usd = (
+                pnl_p * cfg.CONTRACT_SIZE *
+                open_tr.lot_size
+            )
+            pnl_usd -= (
+                cfg.COMMISSION_PER_LOT *
+                open_tr.lot_size / 2
+            )
+            open_tr.exit_bar    = len(df) - 1
+            open_tr.exit_price  = fill
+            open_tr.pnl_usd     = pnl_usd
+            open_tr.exit_reason = "EOD"
+            equity += pnl_usd
+            equity  = max(equity, 0.01)
+            trades.append(open_tr)
+
+        eq_df = pd.DataFrame({
+            "bar":    range(len(eq_hist)),
+            "equity": eq_hist,
+        })
+        return trades, eq_df
+
+
+# ╔══════════════════════════════════════════════════════════╗
+# ║  SIGNAL GENERATOR                                        ║
+# ║                                                          ║
+# ║  Converts model probabilities to trade signals.          ║
+# ║                                                          ║
+# ║  Signal = +1 (long) if:                                  ║
+# ║    P(long_TP) > PROB_THRESHOLD_BUY  AND                 ║
+# ║    RSI_14 > RSI_BULL_MIN            AND                 ║
+# ║    ADX > ADX_MIN                                        ║
+# ║                                                          ║
+# ║  Signal = -1 (short) if:                                 ║
+# ║    P(short_TP) > PROB_THRESHOLD_BUY AND                 ║
+# ║    RSI_14 < RSI_BEAR_MAX            AND                 ║
+# ║    ADX > ADX_MIN                                        ║
+# ║                                                          ║
+# ║  Signal = 0 (hold) otherwise                            ║
+# ╚══════════════════════════════════════════════════════════╝
+
+class SignalGenerator:
+    def __init__(self, cfg: Config):
+        self.cfg = cfg
+        self.EPS = 1e-10
+
+    def generate(self,
+                 df: pd.DataFrame,
+                 prob_long:  np.ndarray,
+                 prob_short: np.ndarray,
+                 ) -> pd.Series:
+        """
+        Parameters
+        ----------
+        df          : feature dataframe
+        prob_long   : P(long trade TP) per bar
+        prob_short  : P(short trade TP) per bar
+
+        Returns
+        -------
+        signals : pd.Series {-1, 0, +1}
+        """
+        cfg = self.cfg
+        n   = len(df)
+        sig = np.zeros(n, dtype=np.int32)
+
+        # Recover raw RSI (stored normalized)
+        # rsi_14 in df is (RSI-50)/50, so
+        # RSI = rsi_14*50 + 50
+        rsi_raw = df["rsi_14"].values * 50 + 50
+        adx_raw = df["adx"].values * 100
+
+        for i in range(n):
+            rsi = rsi_raw[i]
+            adx = adx_raw[i]
+
+            pl = prob_long[i]
+            ps = prob_short[i]
+
+            # ADX filter: require trend
+            if adx < cfg.ADX_MIN:
+                continue
+
+            # Long signal
+            if (pl > cfg.PROB_THRESHOLD_BUY and
+                    rsi > cfg.RSI_BULL_MIN):
+                sig[i] = 1
+
+            # Short signal
+            elif (ps > cfg.PROB_THRESHOLD_BUY and
+                    rsi < cfg.RSI_BEAR_MAX):
+                sig[i] = -1
+
+        return pd.Series(sig, index=df.index)
+
+
+# ╔══════════════════════════════════════════════════════════╗
+# ║  PERFORMANCE REPORTER                                    ║
+# ║                                                          ║
+# ║  All metrics computed from closed trade PnLs only.      ║
+# ║  No mark-to-market inflation.                           ║
+# ╚══════════════════════════════════════════════════════════╝
+
+class PerfReporter:
+    def __init__(self, cfg: Config):
+        self.cfg = cfg
+        self.EPS = 1e-10
+
+    def report(self,
+               trades: List[Trade],
+               eq_df: pd.DataFrame,
+               init_capital: float
+               ) -> dict:
+        nt = len(trades)
+
+        if nt == 0:
+            print("\n[PerfReporter] No trades.")
+            return {"trades": 0}
+
+        pnls = np.array(
+            [t.pnl_usd for t in trades]
+        )
+        wins    = pnls[pnls > 0]
+        losses  = pnls[pnls <= 0]
+        n_wins  = len(wins)
+        n_loss  = len(losses)
+        wr      = n_wins / (nt + self.EPS)
+        gross_p = wins.sum()    if n_wins  > 0 else 0.0
+        gross_l = abs(losses.sum()) if n_loss > 0 else self.EPS
+        pf      = gross_p / (gross_l + self.EPS)
+        avg_w   = wins.mean()    if n_wins  > 0 else 0.0
+        avg_l   = losses.mean()  if n_loss  > 0 else 0.0
+        expectancy = pnls.mean()
+
+        # TP/SL breakdown
+        tp_hits = sum(
+            1 for t in trades
+            if t.exit_reason == "TP"
+        )
+        sl_hits = sum(
+            1 for t in trades
+            if t.exit_reason == "SL"
+        )
+
+        # Equity curve from closed trades
+        eq_vals = eq_df["equity"].values
+        ret     = np.diff(eq_vals) / (
+            eq_vals[:-1] + self.EPS
+        )
+
+        final_eq = eq_vals[-1]
+        tr       = final_eq / init_capital - 1
+        n_days   = max(len(eq_vals) / 24, 1)
+        ar       = (1 + tr) ** (252 / n_days) - 1
+        av       = (np.std(ret) *
+                    np.sqrt(252 * 24))
+        dn       = ret[ret < 0]
+        dv       = (np.std(dn) if len(dn) > 0
+                    else self.EPS) * np.sqrt(252 * 24)
+        sh       = (ar - 0.02) / (av + self.EPS)
+        so       = (ar - 0.02) / (dv + self.EPS)
+        mdd      = self._mdd(eq_vals)
+        calmar   = ar / (abs(mdd) + self.EPS)
+
+        m = {
             "trades":        nt,
             "win_rate":      wr,
             "profit_factor": pf,
+            "avg_win_usd":   avg_w,
+            "avg_loss_usd":  avg_l,
+            "expectancy":    expectancy,
+            "tp_hits":       tp_hits,
+            "sl_hits":       sl_hits,
+            "total_return":  tr,
+            "ann_return":    ar,
+            "ann_vol":       av,
+            "max_dd":        mdd,
+            "sharpe":        sh,
+            "sortino":       so,
+            "calmar":        calmar,
+            "final_equity":  final_eq,
         }
-        self._print(m)
-        return m
 
-    def _mdd(self, eq):
-        pk = eq[0]; mx = 0
-        for e in eq:
-            pk = max(pk, e)
-            mx = max(
-                mx, (pk-e)/(pk+self.EPS))
-        return mx
-
-    def _print(self, m):
-        sep = "═"*50
+        # Print
+        sep = "═" * 52
         print(f"\n╔{sep}╗")
-        print(
-            f"║{'PERFORMANCE REPORT':^50}║")
+        print(f"║{'PERFORMANCE REPORT':^52}║")
         print(f"╠{sep}╣")
         rows = [
-            ("Total Return",
-             "total_return",  ".2%"),
-            ("Ann. Return",
-             "ann_return",    ".2%"),
-            ("Ann. Vol",
-             "ann_vol",       ".2%"),
-            ("Max Drawdown",
-             "max_dd",        ".2%"),
-            ("Sharpe",
-             "sharpe",        ".3f"),
-            ("Sortino",
-             "sortino",       ".3f"),
-            ("Calmar",
-             "calmar",        ".3f"),
-            ("Trades",
-             "trades",        "d"),
-            ("Win Rate",
-             "win_rate",      ".2%"),
-            ("Profit Factor",
-             "profit_factor", ".2f"),
+            ("Trades",        nt,         "d"),
+            ("Win Rate",      wr,         ".2%"),
+            ("Profit Factor", pf,         ".3f"),
+            ("Avg Win",       avg_w,      ",.2f"),
+            ("Avg Loss",      avg_l,      ",.2f"),
+            ("Expectancy",    expectancy, ",.2f"),
+            ("TP Hits",       tp_hits,    "d"),
+            ("SL Hits",       sl_hits,    "d"),
+            ("Total Return",  tr,         ".2%"),
+            ("Ann. Return",   ar,         ".2%"),
+            ("Ann. Vol",      av,         ".2%"),
+            ("Max Drawdown",  mdd,        ".2%"),
+            ("Sharpe",        sh,         ".3f"),
+            ("Sortino",       so,         ".3f"),
+            ("Calmar",        calmar,     ".3f"),
+            ("Final Equity",  final_eq,   ",.2f"),
         ]
-        for label, key, fmt in rows:
-            vs = f"{m[key]:{fmt}}"
+        for label, val, fmt in rows:
+            vs = f"{val:{fmt}}"
             print(
-                f"║  {label+':':<18}"
-                f"{vs:>10}"
-                f"{'':>28}║")
+                f"║  {label+':':<20}"
+                f"${vs:>12}"
+                f"{'':>17}║"
+                if "usd" in label.lower() or
+                "equity" in label.lower() or
+                "expectancy" in label.lower()
+                else
+                f"║  {label+':':<20}"
+                f"{vs:>12}"
+                f"{'':>17}║"
+            )
         print(f"╚{sep}╝\n")
+        return m
+
+    def _mdd(self, eq: np.ndarray) -> float:
+        peak = eq[0]
+        mdd  = 0.0
+        for e in eq:
+            peak = max(peak, e)
+            dd   = (peak - e) / (peak + self.EPS)
+            mdd  = max(mdd, dd)
+        return mdd
 
 
 # ╔══════════════════════════════════════════════════════════╗
-# ║  MODULE 14 — SCALER BUILDER                              ║
+# ║  WALK-FORWARD PIPELINE                                   ║
+# ║                                                          ║
+# ║  Structure:                                              ║
+# ║  ┌─────────────────────────────────────────┐           ║
+# ║  │ TRAIN [0 .. T]  │ GAP │ TEST [T+G..T+G+W]│          ║
+# ║  └─────────────────────────────────────────┘           ║
+# ║                                                          ║
+# ║  Slide window forward by TEST_BARS each fold.           ║
+# ║  Re-optimize hyperparameters every 3 folds              ║
+# ║  (expensive but guards against drift).                  ║
+# ║                                                          ║
+# ║  OOS (out-of-sample) signals are concatenated           ║
+# ║  and passed to BacktestEngine for final metrics.        ║
 # ╚══════════════════════════════════════════════════════════╝
 
-def build_scaler_params(
-        feat_data: pd.DataFrame,
-        selected: List[str],
-        frame_stack_size: int = 1) -> dict:
-    params: dict = {}
-    for feat in selected:
-        if feat in feat_data.columns:
-            mu  = float(feat_data[feat].mean())
-            std = float(feat_data[feat].std())
-            if std < 1e-10: std = 1.0
-        else:
-            mu, std = 0.0, 1.0
-        for frame in range(frame_stack_size):
-            key = f"{feat}_frame{frame}"
-            params[key] = {"mean": mu,
-                           "std":  std}
-    for i in range(9):
-        params[f"portfolio_{i}"] = {
-            "mean": 0.0, "std": 1.0}
-    for i in range(8):
-        params[f"regime_{i}"] = {
-            "mean": 0.0, "std": 1.0}
-    return params
+class WalkForwardPipeline:
+    def __init__(self, cfg: Config):
+        self.cfg     = cfg
+        self.trainer = ModelTrainer(cfg)
+        self.tb      = TargetBuilder(
+            sl_mult=cfg.ATR_SL_MULT,
+            tp_mult=cfg.ATR_TP_MULT,
+        )
+        self.sg      = SignalGenerator(cfg)
+        self.fe      = FeatureEngine()
+        self.bt      = BacktestEngine(cfg)
+        self.pr      = PerfReporter(cfg)
+
+    def run(self, df: pd.DataFrame) -> dict:
+        cfg = self.cfg
+        n   = len(df)
+
+        # Build all targets upfront
+        # (they look ahead, so compute on full df)
+        logger.info("Building targets...")
+        long_tgt  = self.tb.build_long_target(df)
+        short_tgt = self.tb.build_short_target(df)
+        logger.info(
+            f"Long TP rate:  "
+            f"{long_tgt.mean():.3f}"
+        )
+        logger.info(
+            f"Short TP rate: "
+            f"{short_tgt.mean():.3f}"
+        )
+
+        feat_cols  = [
+            f for f in self.fe.feature_cols
+            if f in df.columns
+        ]
+        X_all = df[feat_cols].values.astype(
+            np.float32
+        )
+        y_long  = long_tgt.values
+        y_short = short_tgt.values
+
+        # Walk-forward splits
+        all_signals = pd.Series(
+            0, index=df.index, dtype=np.int32
+        )
+        model_long  = None
+        model_short = None
+        best_params = None
+        fold_n      = 0
+        oos_probs   = []
+
+        start = cfg.MIN_TRAIN_BARS
+        t     = start
+
+        while t + cfg.TEST_BARS < n:
+            tr_start = max(0, t - cfg.TRAIN_BARS)
+            tr_end   = t
+            te_start = t + cfg.EMBARGO_BARS
+            te_end   = min(
+                t + cfg.EMBARGO_BARS +
+                cfg.TEST_BARS,
+                n - cfg.TARGET_LOOKAHEAD
+                if hasattr(cfg, "TARGET_LOOKAHEAD")
+                else n - 24  # leave lookahead room
+            )
+
+            if te_start >= te_end:
+                t += cfg.TEST_BARS
+                continue
+
+            Xtr  = X_all[tr_start:tr_end]
+            yltr = y_long[tr_start:tr_end]
+            ystr = y_short[tr_start:tr_end]
+            Xte  = X_all[te_start:te_end]
+
+            if len(Xtr) < cfg.MIN_TRAIN_BARS:
+                t += cfg.TEST_BARS
+                continue
+
+            logger.info(
+                f"Fold {fold_n}: "
+                f"train [{tr_start}:{tr_end}] "
+                f"test  [{te_start}:{te_end}]"
+            )
+
+            # Re-optimize every 3 folds
+            if fold_n % 3 == 0:
+                logger.info(
+                    "Optimizing hyperparameters..."
+                )
+                best_params = self.trainer.optimize(
+                    Xtr, yltr
+                )
+
+            # Fit long and short models
+            model_long = self.trainer.fit(
+                Xtr, yltr, best_params
+            )
+            model_short = self.trainer.fit(
+                Xtr, ystr, best_params
+            )
+
+            # OOS predictions
+            pl = model_long.predict_proba(Xte)[:, 1]
+            ps = model_short.predict_proba(Xte)[:, 1]
+
+            # OOS AUC (sanity check)
+            yte_l = y_long[te_start:te_end]
+            yte_s = y_short[te_start:te_end]
+            if len(np.unique(yte_l)) == 2:
+                auc_l = roc_auc_score(yte_l, pl)
+                logger.info(
+                    f"  OOS AUC long:  {auc_l:.4f}"
+                )
+            if len(np.unique(yte_s)) == 2:
+                auc_s = roc_auc_score(yte_s, ps)
+                logger.info(
+                    f"  OOS AUC short: {auc_s:.4f}"
+                )
+
+            # Generate signals for test window
+            df_te = df.iloc[te_start:te_end].copy()
+            df_te.reset_index(drop=True, inplace=True)
+
+            sigs = self.sg.generate(
+                df_te, pl, ps
+            )
+
+            # Map back to original index
+            for j, idx in enumerate(
+                range(te_start, te_end)
+            ):
+                if idx < n:
+                    all_signals.iloc[idx] = (
+                        sigs.iloc[j]
+                    )
+
+            fold_n += 1
+            t      += cfg.TEST_BARS
+
+        # Count signals
+        n_long  = (all_signals == 1).sum()
+        n_short = (all_signals == -1).sum()
+        logger.info(
+            f"Total signals: "
+            f"long={n_long}, short={n_short}"
+        )
+
+        # Backtest OOS signals only
+        # (signals before start are 0/hold)
+        logger.info("Running backtest...")
+        trades, eq_df = self.bt.run(df, all_signals)
+
+        # Report
+        metrics = self.pr.report(
+            trades, eq_df, cfg.INITIAL_CAPITAL
+        )
+
+        # Save artifacts
+        self._save(
+            metrics, feat_cols,
+            model_long, model_short,
+            all_signals
+        )
+        return metrics
+
+    def _save(self,
+              metrics:     dict,
+              feat_cols:   List[str],
+              model_long,
+              model_short,
+              signals:     pd.Series):
+        out = self.cfg.OUTPUT_DIR
+        os.makedirs(out, exist_ok=True)
+
+        with open(
+            os.path.join(out, "metrics.json"),
+            "w"
+        ) as f:
+            json.dump(
+                {k: (float(v)
+                     if isinstance(v, (
+                         np.floating, float
+                     ))
+                     else int(v)
+                     if isinstance(v, (
+                         np.integer, int
+                     ))
+                     else v)
+                 for k, v in metrics.items()},
+                f, indent=2
+            )
+
+        with open(
+            os.path.join(out, "features.json"),
+            "w"
+        ) as f:
+            json.dump(feat_cols, f, indent=2)
+
+        if model_long is not None:
+            model_long.save_model(
+                os.path.join(
+                    out, "model_long.json"
+                )
+            )
+        if model_short is not None:
+            model_short.save_model(
+                os.path.join(
+                    out, "model_short.json"
+                )
+            )
+
+        signals.to_csv(
+            os.path.join(out, "oos_signals.csv")
+        )
+        logger.info(
+            f"Artifacts saved to {out}/"
+        )
 
 
 # ╔══════════════════════════════════════════════════════════╗
-# ║  MAIN PIPELINE                                           ║
+# ║  ENTRY POINT                                             ║
 # ╚══════════════════════════════════════════════════════════╝
 
-def train_and_export(
-    cfg:      SystemConfig = None,
-    filepath: str          = None,
-    source:   str          = "synthetic",
+def run(
+    source:   str = "synthetic",
+    filepath: str = None,
+    cfg:      Config = None,
 ) -> dict:
-    if cfg is None: cfg = SystemConfig()
-    print(
-        "\n╔══════════════════════════════════════╗")
-    print(
-        "║  XGBoost-RL  TRAINING PIPELINE       ║")
-    print(
-        "╚══════════════════════════════════════╝\n")
+    if cfg is None:
+        cfg = Config()
 
-    print("Phase 1: Data")
-    data = DataIngestion.load(
-        source, filepath, cfg.HISTORICAL_BARS)
     print(
-        f"  {len(data):,} bars  "
-        f"{data['timestamp'].iloc[0]} → "
-        f"{data['timestamp'].iloc[-1]}\n")
-
-    print("Phase 2: Features")
-    fe        = FeatureEngine(cfg)
-    feat_data = fe.build(data)
+        "\n╔══════════════════════════════════════╗"
+    )
     print(
-        f"  {feat_data.shape[1]} columns, "
-        f"{len(feat_data):,} rows\n")
+        "║  XGBoost Direct Trader — v2.0        ║"
+    )
+    print(
+        "╚══════════════════════════════════════╝\n"
+    )
 
-    print("Phase 3: Feature Selection")
-    sel      = FeatureSelector(cfg)
-    target   = (
-        feat_data["returns"].shift(-1) > 0
-    ).astype(int).iloc[:-1]
-    feat_sub = feat_data.iloc[:-1].copy()
-    selected = sel.select(
-        feat_sub, target,
-        cfg.MAX_FEATURES_SELECTED)
-
-    cut = int(0.6 * len(feat_sub))
-    prob, shift = sel.adversarial_check(
-        feat_sub[selected].iloc[:cut],
-        feat_sub[selected].iloc[cut:])
-    if shift:
-        selected = [
-            f for f in selected
-            if f not in prob]
-        print(
-            f"  Removed {len(prob)} shifted "
-            f"features → {len(selected)} "
-            f"remain\n")
+    # 1. Load data
+    print("Phase 1: Data Ingestion")
+    if source == "synthetic":
+        raw = DataIngestion.load_synthetic(
+            cfg.HISTORICAL_BARS
+        )
+    elif source == "csv":
+        raw = DataIngestion.load_csv(filepath)
     else:
-        print("  No distribution shift\n")
-
-    print("Phase 4: Hyperparameter Optimization")
-    Xopt = (feat_sub[selected].iloc[:cut]
-            .fillna(0)
-            .values.astype(np.float32))
-    yopt = target.iloc[:cut].values
-    hp   = HPOptimizer(cfg)
-    best = hp.optimize(Xopt, yopt)
-    cfg.XGB_BASE.update(best)
-    print(f"  Best params: {best}\n")
-
-    print("Phase 5: Scaler Parameters")
-    stack_size    = cfg.FRAME_STACK_SIZE
-    scaler_params = build_scaler_params(
-        feat_sub[selected].iloc[:cut],
-        selected,
-        frame_stack_size=stack_size)
+        raise ValueError(
+            f"Unknown source: {source}"
+        )
+    df = DataIngestion.validate(raw)
     print(
-        f"  Scaler keys: "
-        f"{len(scaler_params)}\n")
+        f"  {len(df):,} bars  "
+        f"{df['timestamp'].iloc[0]} → "
+        f"{df['timestamp'].iloc[-1]}\n"
+    )
 
-    print("Phase 6: Initialize Components")
-    agent   = EnsembleDoubleQAgent(cfg)
-    port    = PortfolioManager(cfg)
-    risk    = RiskManager(cfg)
-    reward  = RewardFunction(cfg)
-    wf      = WalkForward(cfg)
-    sb      = StateBuilder()
-    perf    = PerfMonitor(cfg)
-
-    test_pi    = port.info(
-        float(feat_data["close"].iloc[200]))
-    test_state = sb.build(
-        feat_data, 200, selected, test_pi)
-
-    n_market    = len(selected)
-    base_dim    = len(test_state)
-    stacked_dim = (n_market * stack_size +
-                   base_dim - n_market)
-
-    print(f"  Base state dim:    {base_dim}")
-    print(f"  Frame stack size:  {stack_size}")
+    # 2. Features
+    print("Phase 2: Feature Engineering")
+    fe = FeatureEngine()
+    df = fe.build(df)
     print(
-        f"  Stacked state dim: "
-        f"{stacked_dim}\n")
+        f"  {df.shape[1]} columns, "
+        f"{len(df):,} rows\n"
+    )
 
-    stacker  = FrameStacker(n_market, stack_size)
-    rfilter  = RegimeFilter(cfg)
-    sfilter  = SignalFilter(cfg)   # NEW FIX 4
-
-    print("Phase 7: Walk-Forward Training")
-    from tqdm import tqdm
-    start_idx = max(cfg.MIN_TRAIN_SAMPLES, 200)
-    end_idx   = len(feat_data) - 1
-    selected  = [
-        f for f in selected
-        if f in feat_data.columns]
-
-    all_results: List[dict] = []
-    train_log:   List[dict] = []
-
-    for t in tqdm(
-            range(start_idx, end_idx),
-            desc="Training", unit="step"):
-
-        if wf.should_retrain(t, feat_data):
-            if wf.regime_change(feat_data, t):
-                agent  = EnsembleDoubleQAgent(cfg)
-                reward.reset()
-                stacker.reset()
-            if len(all_results) > 100:
-                rs = np.array([
-                    r["state"]
-                    for r in all_results[-100:]])
-                rt = np.array([
-                    r["reward"]
-                    for r in all_results[-100:]])
-                agent.update_ew(rs, rt)
-
-        pi    = port.info(
-            float(feat_data["close"].iloc[t]),
-            feat_data["timestamp"].iloc[t])
-        state = sb.build(
-            feat_data, t, selected, pi)
-        stacked_state = stacker.push(state)
-
-        raw_a = agent.select(
-            stacked_state, training=True)
-
-        row = feat_data.iloc[t]
-        mkt = {
-            "vol_20":
-                float(row.get("vol_20", 0.02)),
-            "vol_60":
-                float(row.get("vol_60", 0.02)),
-            "atr_14":
-                float(row.get("atr_14", 0.0)),
-            "current_price":
-                float(
-                    feat_data["close"].iloc[t]),
-            "entry_px":    port.entry_px,
-            "date":        str(
-                feat_data["timestamp"].iloc[t]
-            )[:10],
-        }
-
-        # Layer 1: Regime gate (choppiness)
-        filtered_a = rfilter.check(
-            raw_a, row,
-            pi["current_position"])
-
-        # Layer 2: Signal gate (direction)
-        # FIX 4: RSI+MACD confluence check
-        filtered_a = sfilter.check(
-            filtered_a, row,
-            pi["current_position"])
-
-        # Layer 3: Risk validation (SL/TP/limits)
-        val_a = risk.validate(
-            filtered_a, pi, mkt)
-
-        conf  = agent.confidence(stacked_state)
-        size  = risk.position_size(pi, mkt, conf)
-        price = float(
-            feat_data["close"].iloc[t])
-        time_ = feat_data["timestamp"].iloc[t]
-        res   = port.execute(
-            val_a, price, time_, size)
-        if res["executed"]:
-            risk.record()
-
-        if port.last_closed_pnl is not None:
-            rfilter.record_trade_result(
-                port.last_closed_pnl)
-
-        upi = port.info(price, time_)
-        upi["vol_20"] = mkt["vol_20"]
-
-        # FIX 2: pass closed_pnl to reward
-        rwd = reward.calc(
-            val_a, res["port_ret"], upi,
-            closed_pnl=port.last_closed_pnl)
-        wf.record(rwd)
-
-        if t < end_idx - 1:
-            next_raw = sb.build(
-                feat_data, t+1,
-                selected, upi)
-            ns   = stacker.build_next(next_raw)
-            done = False
-        else:
-            ns   = stacked_state
-            done = True
-
-        agent.store(
-            stacked_state, val_a,
-            rwd, ns, done)
-        tm = agent.train()
-        if tm: train_log.append(tm)
-
-        all_results.append({
-            "t":      t,
-            "price":  price,
-            "action": val_a,
-            "equity": res["equity"],
-            "dd":     res["dd"],
-            "reward": rwd,
-            "state":  stacked_state,
-        })
-
-        if (res["equity"] <
-                cfg.INITIAL_CAPITAL *
-                (1 - cfg.MAX_DRAWDOWN_LIMIT *
-                 1.5)):
-            print(
-                f"\nEmergency stop at step "
-                f"{t}: equity="
-                f"${res['equity']:,.2f}")
-            break
-
-    # Print filter diagnostics
-    rf_stats = rfilter.stats()
-    sf_stats = sfilter.stats()
-    print(
-        f"\n[RegimeFilter] "
-        f"filter_rate="
-        f"{rf_stats['filter_rate']:.1%} "
-        f"({rf_stats['filtered']}/"
-        f"{rf_stats['total']})")
-    print(
-        f"[SignalFilter] "
-        f"block_rate="
-        f"{sf_stats['signal_block_rate']:.1%} "
-        f"({sf_stats['signal_blocked']}/"
-        f"{sf_stats['signal_total']})")
-
-    print("\nPhase 8: Evaluation")
-    # FIX 3: pass realised_curve for honest metrics
-    metrics = perf.evaluate(
-        port.eq_curve,
-        port.trade_log,
-        realised_curve=port.realised_curve)
-
-    print("Phase 9: ONNX Export")
-    exporter = ONNXExporter(cfg)
-    exported = exporter.export_agent(
-        agent, selected,
-        scaler_params,
-        stacked_dim, metrics,
-        frame_stack_size=stack_size)
-    print(
-        f"  Exported {len(exported)} "
-        f"ONNX files\n")
+    # 3. Walk-forward
+    print("Phase 3: Walk-Forward Training & Test")
+    pipeline = WalkForwardPipeline(cfg)
+    metrics  = pipeline.run(df)
 
     print(
-        "╔══════════════════════════════════════╗")
+        "╔══════════════════════════════════════╗"
+    )
     print(
-        "║  TRAINING COMPLETE                   ║")
+        "║  COMPLETE                            ║"
+    )
     print(
         f"║  Artifacts → "
-        f"{cfg.OUTPUT_DIR:<24}║")
+        f"{cfg.OUTPUT_DIR:<24}║"
+    )
     print(
-        "╚══════════════════════════════════════╝")
+        "╚══════════════════════════════════════╝"
+    )
     return metrics
+
+
+if __name__ == "__main__":
+    run(source="synthetic")

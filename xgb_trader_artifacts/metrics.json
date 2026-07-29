@@ -1,42 +1,7 @@
 {
-  "val_auc": {
-    "buy": 0.5699699321149667,
-    "sell": 0.5646580369545123
-  },
-  "val_backtest": {
-    "total_trades": 156,
-    "win_rate": 0.5064,
-    "profit_factor": 1.6014,
-    "total_pnl_r": 44.5,
-    "max_drawdown_r": 8.0,
-    "sharpe_ratio": 17.8631,
-    "expectancy_r": 0.2853,
-    "score": 11.64352163014482
-  },
-  "holdout_backtest": {
-    "total_trades": 117,
-    "win_rate": 0.5214,
-    "profit_factor": 1.6636,
-    "total_pnl_r": 36.5,
-    "max_drawdown_r": 7.0,
-    "sharpe_ratio": 19.4297,
-    "expectancy_r": 0.312,
-    "score": 12.455573316664665
-  },
-  "optimal_threshold": 0.56,
-  "passed_holdout_check": true,
-  "best_params": {
-    "n_estimators": 600,
-    "max_depth": 4,
-    "learning_rate": 0.06660851221903093,
-    "subsample": 0.8728145723614381,
-    "colsample_bytree": 0.9756788788642481,
-    "gamma": 2.5084287367099805,
-    "min_child_weight": 3,
-    "random_state": 42,
-    "verbosity": 0,
-    "eval_metric": "logloss",
-    "device": "cuda",
-    "tree_method": "hist"
-  }
+  "oos_buy_auc": 0.3269312275535925,
+  "oos_sell_auc": 0.49366371020982225,
+  "buy_threshold": 0.63,
+  "sell_threshold": 0.63,
+  "total_test_bars": 9989
 }

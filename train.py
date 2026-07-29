@@ -1,13 +1,11 @@
 # ════════════════════════════════════════════════════════
-# train.py — v2.1 SUPERVISED CLASSIFICATION & ONNX PIPELINE
+# train.py — v2.2 SUPERVISED CLASSIFICATION & ONNX PIPELINE
 # ════════════════════════════════════════════════════════
 
 import gc, os, sys, psutil, shutil, json, joblib
 import pandas as pd
 import numpy as np
-from sklearn.feature_selection import mutual_info_classif
 from sklearn.metrics import roc_auc_score, log_loss
-from sklearn.calibration import CalibratedClassifierCV
 from xgboost import XGBClassifier
 
 import optuna
@@ -23,7 +21,7 @@ from skl2onnx.common.shape_calculator import calculate_linear_classifier_output_
 from onnxmltools.convert.xgboost.operator_converters.XGBoost import convert_xgboost
 import onnxruntime as ort
 
-# Register XGBClassifier so CalibratedClassifierCV inside skl2onnx recognizes it
+# Register XGBClassifier for ONNX conversion
 update_registered_converter(
     XGBClassifier,
     "XGBoostXGBClassifier",
@@ -32,7 +30,6 @@ update_registered_converter(
     options={"nocl": [True, False], "zipmap": [True, False, "columns"]},
 )
 
-# Pin opset to 3 for ai.onnx.ml domain to prevent ONNX export errors
 TARGET_OPSET = {"": 15, "ai.onnx.ml": 3}
 
 
@@ -78,10 +75,6 @@ def ram():
 # ════════════════════════════════════════════════════════
 class SystemConfig:
     HISTORICAL_BARS = 50000
-    OPTUNA_N_TRIALS = 30
-    OPTUNA_CV_SPLITS = 5
-    MAX_FEATURES_SELECTED = 30
-    CORRELATION_THRESHOLD = 0.90
     OUTPUT_DIR = os.path.join(os.getcwd(), "xgb_trader_artifacts")
     TRADING_PAIR = "EURUSD"
     
@@ -100,6 +93,7 @@ class SystemConfig:
         "colsample_bytree": 0.8,
         "random_state": 42,
         "verbosity": 0,
+        "eval_metric": "logloss"
     }
 
 
@@ -222,25 +216,19 @@ class FeatureEngine:
 
 
 # ════════════════════════════════════════════════════════
-# MODEL TRAINER & CALIBRATION
+# MODEL TRAINER
 # ════════════════════════════════════════════════════════
 class ModelTrainer:
     def __init__(self, cfg):
         self.cfg = cfg
 
-    def train_calibrated_model(self, X_train, y_train):
+    def train_model(self, X_train, y_train):
         params = {**self.cfg.XGB_BASE, **GPU_PARAMS}
         params = {k: v for k, v in params.items() if v is not None}
         
-        base_xgb = XGBClassifier(**params)
-        
-        calibrated_model = CalibratedClassifierCV(
-            estimator=base_xgb,
-            method="isotonic",
-            cv=3
-        )
-        calibrated_model.fit(X_train, y_train)
-        return calibrated_model
+        model = XGBClassifier(**params)
+        model.fit(X_train, y_train)
+        return model
 
 
 # ════════════════════════════════════════════════════════
@@ -319,16 +307,16 @@ if __name__ == "__main__":
     y_buy_tr, y_buy_te = y_buy[:train_size], y_buy[train_size:]
     y_sell_tr, y_sell_te = y_sell[:train_size], y_sell[train_size:]
 
-    print("\nPhase 4: Training & Calibrating Models...")
+    print("\nPhase 4: Training Models...")
     trainer = ModelTrainer(cfg)
     
-    print("  -> Calibrating BUY Model...")
-    model_buy = trainer.train_calibrated_model(X_train, y_buy_tr)
+    print("  -> Training BUY Model...")
+    model_buy = trainer.train_model(X_train, y_buy_tr)
     
-    print("  -> Calibrating SELL Model...")
-    model_sell = trainer.train_calibrated_model(X_train, y_sell_tr)
+    print("  -> Training SELL Model...")
+    model_sell = trainer.train_model(X_train, y_sell_tr)
 
-    print("\nPhase 5: Evaluating Out-of-Sample Calibrated Probabilities...")
+    print("\nPhase 5: Evaluating Out-of-Sample Probabilities...")
     p_buy_te = model_buy.predict_proba(X_test)[:, 1]
     p_sell_te = model_sell.predict_proba(X_test)[:, 1]
 

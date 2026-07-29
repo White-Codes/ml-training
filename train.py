@@ -1,5 +1,5 @@
 # ════════════════════════════════════════════════════════
-# train.py — v3.0 CONTINUOUS OPTUNA TUNING (5-HOUR LOOP)
+# train.py — v3.1 REALISTIC FOREX TARGETS & CONTINUOUS OPTUNA TUNING
 # ════════════════════════════════════════════════════════
 
 import gc, os, sys, psutil, time, json, glob
@@ -57,14 +57,16 @@ class SystemConfig:
     HISTORICAL_BARS = 100000
     OUTPUT_DIR = os.path.join(os.getcwd(), "xgb_trader_artifacts")
     
-    # Execution Window: 5 hours (18,000 seconds) inside GitHub Runner
+    # Execution Window: 5 hours inside GitHub Runner
     MAX_TUNING_TIME_SEC = 5 * 3600  
 
-    # Target & Backtest Parameters
-    TP_PCT = 0.015       # 1.5% Take Profit
-    SL_PCT = 0.010       # 1.0% Stop Loss
-    LOOKAHEAD_BARS = 24
-    PROB_THRESHOLD_BUY = 0.52   # Lowered to capture trade signals during search
+    # Adjusted TP/SL targets for EUR/USD H1 (30 pips TP / 20 pips SL)
+    TP_PCT = 0.0030      
+    SL_PCT = 0.0020      
+    LOOKAHEAD_BARS = 12  # 12-hour max holding window
+    
+    # Fallback initial thresholds
+    PROB_THRESHOLD_BUY = 0.52   
     PROB_THRESHOLD_SELL = 0.52
 
 
@@ -86,7 +88,7 @@ class DataIngestion:
                 df["returns"] = df["close"].pct_change().fillna(0)
             return df.iloc[-max_bars:].reset_index(drop=True)
         
-        raise FileNotFoundError("EURUSD dataset not found in root!")
+        raise FileNotFoundError("EURUSD dataset not found in root directory!")
 
 
 # ════════════════════════════════════════════════════════
@@ -308,6 +310,13 @@ if __name__ == "__main__":
     feature_cols = [c for c in df_feat.columns if c not in ["timestamp", "open", "high", "low", "close", "volume", "returns"]]
     X = df_feat[feature_cols].values.astype(np.float32)
 
+    features_meta = {
+        "feature_cols": feature_cols,
+        "feature_index": {col: idx for idx, col in enumerate(feature_cols)}
+    }
+    with open(os.path.join(cfg.OUTPUT_DIR, "features.json"), "w") as f:
+        json.dump(features_meta, f, indent=2)
+
     train_size = int(len(X) * 0.8)
     X_train, X_test = X[:train_size], X[train_size:]
     y_buy_tr, y_buy_te = y_buy[:train_size], y_buy[train_size:]
@@ -317,20 +326,25 @@ if __name__ == "__main__":
     print(f"\nPhase 4: Entering Continuous 5-Hour Optuna Hyperparameter Optimization Loop...")
     
     best_models = {"buy": None, "sell": None}
-    best_results = {"profit_factor": -1.0}
+    best_results = {"score": -999.0}
 
     def objective(trial):
         if time.time() - start_time > cfg.MAX_TUNING_TIME_SEC:
             trial.study.stop()
-            return 0.0
+            return -999.0
+
+        # Dynamically search optimal threshold alongside tree parameters
+        threshold = trial.suggest_float("prob_threshold", 0.50, 0.58, step=0.01)
+        cfg.PROB_THRESHOLD_BUY = threshold
+        cfg.PROB_THRESHOLD_SELL = threshold
 
         params = {
-            "n_estimators": trial.suggest_int("n_estimators", 150, 800, step=50),
-            "max_depth": trial.suggest_int("max_depth", 3, 9),
+            "n_estimators": trial.suggest_int("n_estimators", 100, 600, step=50),
+            "max_depth": trial.suggest_int("max_depth", 3, 8),
             "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.15, log=True),
             "subsample": trial.suggest_float("subsample", 0.6, 1.0),
             "colsample_bytree": trial.suggest_float("colsample_bytree", 0.6, 1.0),
-            "gamma": trial.suggest_float("gamma", 0.0, 5.0),
+            "gamma": trial.suggest_float("gamma", 0.0, 3.0),
             "random_state": 42,
             "verbosity": 0,
             "eval_metric": "logloss",
@@ -346,20 +360,21 @@ if __name__ == "__main__":
 
         bt = BacktestEngine.run_backtest(df_test, p_b, p_s, cfg)
 
-        # Composite metric prioritizing Profit Factor with trade count penalties
-        if bt["total_trades"] < 15:
-            score = 0.0
+        # Require at least 20 trades; blended score using Profit Factor & Sharpe
+        if bt["total_trades"] < 20:
+            score = -10.0
         else:
-            score = bt["profit_factor"]
+            score = bt["profit_factor"] + (0.5 * bt["sharpe_ratio"])
 
-        if score > best_results.get("score", -1.0):
+        if score > best_results.get("score", -999.0):
             best_results["score"] = score
             best_results["bt"] = bt
+            best_results["threshold"] = threshold
             best_results["auc_buy"] = float(roc_auc_score(y_buy_te, p_b))
             best_results["auc_sell"] = float(roc_auc_score(y_sell_te, p_s))
             best_models["buy"] = model_b
             best_models["sell"] = model_s
-            print(f"  ★ Trial {trial.number} New Best! Trades: {bt['total_trades']} | PF: {bt['profit_factor']} | Win Rate: {bt['win_rate']*100:.1f}%")
+            print(f"  ★ Trial {trial.number} New Best! Trades: {bt['total_trades']} | PF: {bt['profit_factor']} | Win Rate: {bt['win_rate']*100:.1f}% | Thresh: {threshold:.2f}")
 
         return score
 
@@ -371,17 +386,19 @@ if __name__ == "__main__":
     print(f"  ┌──────────────────────────────────────────┐")
     print(f"  │        BEST OPTUNA BACKTEST METRICS      │")
     print(f"  ├──────────────────────────────────────────┤")
-    print(f"  │ Total Trades:   {bt.get('total_trades', 0):<25}│")
-    print(f"  │ Win Rate:       {bt.get('win_rate', 0.0) * 100:.1f}%{'':<21}│")
-    print(f"  │ Profit Factor:  {bt.get('profit_factor', 0.0):<25}│")
-    print(f"  │ Total PnL:      {bt.get('total_pnl_pct', 0.0):.2f}%{'':<20}│")
-    print(f"  │ Max Drawdown:   {bt.get('max_drawdown_pct', 0.0):.2f}%{'':<20}│")
-    print(f"  │ Sharpe Ratio:   {bt.get('sharpe_ratio', 0.0):<25}│")
+    print(f"  │ Optimal Threshold: {best_results.get('threshold', 0.52):<22}│")
+    print(f"  │ Total Trades:      {bt.get('total_trades', 0):<22}│")
+    print(f"  │ Win Rate:          {bt.get('win_rate', 0.0) * 100:.1f}%{'':<18}│")
+    print(f"  │ Profit Factor:     {bt.get('profit_factor', 0.0):<22}│")
+    print(f"  │ Total PnL:         {bt.get('total_pnl_pct', 0.0):.2f}%{'':<17}│")
+    print(f"  │ Max Drawdown:      {bt.get('max_drawdown_pct', 0.0):.2f}%{'':<17}│")
+    print(f"  │ Sharpe Ratio:      {bt.get('sharpe_ratio', 0.0):<22}│")
     print(f"  └──────────────────────────────────────────┘")
 
     metrics = {
         "auc": {"buy": best_results.get("auc_buy", 0), "sell": best_results.get("auc_sell", 0)},
         "backtest": bt,
+        "optimal_threshold": best_results.get("threshold", 0.52),
         "best_params": study.best_params if len(study.trials) > 0 else {}
     }
     with open(os.path.join(cfg.OUTPUT_DIR, "metrics.json"), "w") as f:

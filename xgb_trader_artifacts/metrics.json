@@ -1,10 +1,10 @@
 {
   "auc": {
-    "buy": 0.4332602213680813,
-    "sell": 0.6163504238998789
+    "buy": 0.4317991499858097,
+    "sell": 0.6328669473441375
   },
   "backtest": {
-    "total_trades": 4,
+    "total_trades": 0,
     "win_rate": 0.0,
     "profit_factor": 0.0,
     "total_pnl_pct": 0.0,
@@ -12,11 +12,11 @@
     "sharpe_ratio": 0.0
   },
   "best_params": {
-    "n_estimators": 800,
-    "max_depth": 6,
-    "learning_rate": 0.07673343915994117,
-    "subsample": 0.6704231242838621,
-    "colsample_bytree": 0.9549217455245944,
-    "gamma": 2.988746900964896
+    "n_estimators": 350,
+    "max_depth": 8,
+    "learning_rate": 0.048364096814220756,
+    "subsample": 0.8625000077870373,
+    "colsample_bytree": 0.7230390571626651,
+    "gamma": 3.872580556945837
   }
 }

@@ -1,22 +1,7 @@
 {
-  "auc": {
-    "buy": 0.4458702834898933,
-    "sell": 0.6081631005248285
-  },
-  "backtest": {
-    "total_trades": 2,
-    "win_rate": 0.0,
-    "profit_factor": 0.0,
-    "total_pnl_pct": 0.0,
-    "max_drawdown_pct": 0.0,
-    "sharpe_ratio": 0.0
-  },
-  "best_params": {
-    "n_estimators": 800,
-    "max_depth": 5,
-    "learning_rate": 0.02419568965866039,
-    "subsample": 0.9661348593649806,
-    "colsample_bytree": 0.7642031433003733,
-    "gamma": 1.1906842163890512
-  }
+  "oos_buy_auc": 0.3269312275535925,
+  "oos_sell_auc": 0.49366371020982225,
+  "buy_threshold": 0.63,
+  "sell_threshold": 0.63,
+  "total_test_bars": 9989
 }

@@ -15,11 +15,22 @@ optuna.logging.set_verbosity(optuna.logging.WARNING)
 
 sys.path.insert(0, os.getcwd())
 
-# ── ONNX imports ──
+# ── ONNX imports & XGBClassifier registration ──
 import onnx
 from skl2onnx import convert_sklearn, update_registered_converter
 from skl2onnx.common.data_types import FloatTensorType
+from skl2onnx.common.shape_calculator import calculate_linear_classifier_output_shapes
+from onnxmltools.convert.xgboost.operator_converters.XGBoost import convert_xgboost
 import onnxruntime as ort
+
+# Register XGBClassifier so CalibratedClassifierCV inside skl2onnx recognizes it
+update_registered_converter(
+    XGBClassifier,
+    "XGBoostXGBClassifier",
+    calculate_linear_classifier_output_shapes,
+    convert_xgboost,
+    options={"nocl": [True, False], "zipmap": [True, False, "columns"]},
+)
 
 # Pin opset to 3 for ai.onnx.ml domain to prevent ONNX export errors
 TARGET_OPSET = {"": 15, "ai.onnx.ml": 3}
@@ -96,12 +107,11 @@ class DataIngestion:
     @staticmethod
     def load_data(filepath, max_bars):
         if not os.path.exists(filepath):
-            # Generate synthetic data if file not present
             np.random.seed(42)
             prices = 1.1000 + np.cumsum(np.random.randn(max_bars) * 0.0005)
             opens = np.empty_like(prices)
             opens[0] = prices[0]
-            opens[1:] = prices[:-1]  # Fix open price gap
+            opens[1:] = prices[:-1]
             highs = np.maximum(opens, prices) + np.abs(np.random.randn(max_bars) * 0.0003)
             lows = np.minimum(opens, prices) - np.abs(np.random.randn(max_bars) * 0.0003)
             volumes = np.random.randint(100, 5000, size=max_bars)
@@ -124,7 +134,7 @@ class DataIngestion:
 
 
 # ════════════════════════════════════════════════════════
-# TARGET BUILDER (Fixes Same-Bar Ambiguity)
+# TARGET BUILDER
 # ════════════════════════════════════════════════════════
 class TargetBuilder:
     @staticmethod
@@ -151,7 +161,7 @@ class TargetBuilder:
                 hit_sl = lows[i + j] <= sl_buy_price
 
                 if hit_tp and hit_sl:
-                    y_buy[i] = 0  # Conservative Same-Bar SL default
+                    y_buy[i] = 0
                     break
                 elif hit_sl:
                     y_buy[i] = 0
@@ -166,7 +176,7 @@ class TargetBuilder:
                 hit_sl = highs[i + j] >= sl_sell_price
 
                 if hit_tp and hit_sl:
-                    y_sell[i] = 0  # Conservative Same-Bar SL default
+                    y_sell[i] = 0
                     break
                 elif hit_sl:
                     y_sell[i] = 0
@@ -224,7 +234,6 @@ class ModelTrainer:
         
         base_xgb = XGBClassifier(**params)
         
-        # Calibrate raw outputs using Isotonic Regression
         calibrated_model = CalibratedClassifierCV(
             estimator=base_xgb,
             method="isotonic",
@@ -248,14 +257,14 @@ class ONNXExporter:
         onnx_model = convert_sklearn(
             model,
             initial_types=initial_types,
-            target_opset=TARGET_OPSET
+            target_opset=TARGET_OPSET,
+            options={type(model): {"zipmap": False}}
         )
 
         fpath = os.path.join(self.out_dir, f"{name}.onnx")
         with open(fpath, "wb") as f:
             f.write(onnx_model.SerializeToString())
 
-        # ONNX Runtime Validation
         sess = ort.InferenceSession(fpath)
         dummy = np.zeros((1, num_features), dtype=np.float32)
         in_name = sess.get_inputs()[0].name
@@ -265,7 +274,7 @@ class ONNXExporter:
 
 
 # ════════════════════════════════════════════════════════
-# SESSION STATE & RELAY HELPERS
+# SESSION STATE HELPERS
 # ════════════════════════════════════════════════════════
 def write_progress_flag(output_dir, steps_run: int):
     flag_path = os.path.join(output_dir, "session_progress.json")
@@ -290,7 +299,7 @@ if __name__ == "__main__":
     fe = FeatureEngine()
     df_feat = fe.build(df)
 
-    print("Phase 3: Labeling Targets (TP/SL same-bar ambiguity resolved)...")
+    print("Phase 3: Labeling Targets...")
     y_buy, y_sell = TargetBuilder.build_targets(
         df_feat, cfg.TP_PCT, cfg.SL_PCT, cfg.LOOKAHEAD_BARS
     )
@@ -298,7 +307,6 @@ if __name__ == "__main__":
     feature_cols = [c for c in df_feat.columns if c not in ["timestamp", "open", "high", "low", "close", "volume", "returns"]]
     X = df_feat[feature_cols].values.astype(np.float32)
 
-    # Save canonical feature names and indices
     features_meta = {
         "feature_cols": feature_cols,
         "feature_index": {col: idx for idx, col in enumerate(feature_cols)}

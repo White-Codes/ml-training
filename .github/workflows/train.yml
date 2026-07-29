@@ -43,7 +43,7 @@ jobs:
         run: |
           git pull origin main || true
 
-      - name: Run 5.5-Hour Training Session
+      - name: Run Training Session
         env:
           PYTHONUNBUFFERED: "1"
         run: |
@@ -55,7 +55,10 @@ jobs:
         run: |
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git add -A xgb_trader_artifacts/ || true
+          git stash || true
           git pull origin main --rebase || true
+          git stash pop || true
           git add -A xgb_trader_artifacts/ || true
           git diff --staged --quiet || git commit -m "Auto-save model artifacts [skip ci]"
           git push origin main || true

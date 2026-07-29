@@ -1,7 +1,0 @@
-{
-  "oos_buy_auc": 0.3269312275535925,
-  "oos_sell_auc": 0.49366371020982225,
-  "buy_threshold": 0.63,
-  "sell_threshold": 0.63,
-  "total_test_bars": 9989
-}

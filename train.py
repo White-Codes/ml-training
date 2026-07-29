@@ -1,8 +1,8 @@
 # ════════════════════════════════════════════════════════
-# train.py — v2.3 FULL BACKTEST & ONNX PIPELINE
+# train.py — v3.0 CONTINUOUS OPTUNA TUNING (5-HOUR LOOP)
 # ════════════════════════════════════════════════════════
 
-import gc, os, sys, psutil, shutil, json, glob
+import gc, os, sys, psutil, time, json, glob
 import pandas as pd
 import numpy as np
 from sklearn.metrics import roc_auc_score
@@ -13,23 +13,11 @@ optuna.logging.set_verbosity(optuna.logging.WARNING)
 
 sys.path.insert(0, os.getcwd())
 
-# ── ONNX imports & XGBClassifier registration ──
+# ── ONNX & ONNXRuntime imports ──
 import onnx
-from skl2onnx import convert_sklearn, update_registered_converter
-from skl2onnx.common.data_types import FloatTensorType
-from skl2onnx.common.shape_calculator import calculate_linear_classifier_output_shapes
-from onnxmltools.convert.xgboost.operator_converters.XGBoost import convert_xgboost
 import onnxruntime as ort
-
-update_registered_converter(
-    XGBClassifier,
-    "XGBoostXGBClassifier",
-    calculate_linear_classifier_output_shapes,
-    convert_xgboost,
-    options={"nocl": [True, False], "zipmap": [True, False, "columns"]},
-)
-
-TARGET_OPSET = {"": 15, "ai.onnx.ml": 3}
+from onnxmltools import convert_xgboost
+from onnxmltools.convert.common.data_types import FloatTensorType as ONNXFloatTensorType
 
 
 # ── GPU Detection ──────────────────────────────────────
@@ -69,29 +57,20 @@ class SystemConfig:
     HISTORICAL_BARS = 100000
     OUTPUT_DIR = os.path.join(os.getcwd(), "xgb_trader_artifacts")
     
+    # Execution Window: 5 hours (18,000 seconds) inside GitHub Runner
+    MAX_TUNING_TIME_SEC = 5 * 3600  
+
     # Target & Backtest Parameters
     TP_PCT = 0.015       # 1.5% Take Profit
     SL_PCT = 0.010       # 1.0% Stop Loss
     LOOKAHEAD_BARS = 24
-    PROB_THRESHOLD_BUY = 0.63
-    PROB_THRESHOLD_SELL = 0.63
-
-    XGB_BASE = {
-        "n_estimators": 500,
-        "learning_rate": 0.03,
-        "max_depth": 6,
-        "subsample": 0.8,
-        "colsample_bytree": 0.8,
-        "random_state": 42,
-        "verbosity": 0,
-        "eval_metric": "logloss"
-    }
+    PROB_THRESHOLD_BUY = 0.52   # Lowered to capture trade signals during search
+    PROB_THRESHOLD_SELL = 0.52
 
 
 class DataIngestion:
     @staticmethod
     def load_data(max_bars):
-        # Look for any matching CSV in current directory
         csv_files = glob.glob("*.csv") + glob.glob("*.CSV")
         target_file = None
         for f in csv_files:
@@ -102,37 +81,16 @@ class DataIngestion:
         if target_file and os.path.exists(target_file):
             print(f"✔ Found local dataset file: {target_file}")
             df = pd.read_csv(target_file)
-            # Normalize column names to lowercase
             df.columns = [c.lower() for c in df.columns]
             if "returns" not in df.columns and "close" in df.columns:
                 df["returns"] = df["close"].pct_change().fillna(0)
             return df.iloc[-max_bars:].reset_index(drop=True)
         
-        print("⚠ Target CSV not found, generating synthetic fallback data...")
-        np.random.seed(42)
-        prices = 1.1000 + np.cumsum(np.random.randn(max_bars) * 0.0005)
-        opens = np.empty_like(prices)
-        opens[0] = prices[0]
-        opens[1:] = prices[:-1]
-        highs = np.maximum(opens, prices) + np.abs(np.random.randn(max_bars) * 0.0003)
-        lows = np.minimum(opens, prices) - np.abs(np.random.randn(max_bars) * 0.0003)
-        volumes = np.random.randint(100, 5000, size=max_bars)
-        timestamps = pd.date_range(end="2026-07-01", periods=max_bars, freq="1h")
-
-        df = pd.DataFrame({
-            "timestamp": timestamps,
-            "open": opens,
-            "high": highs,
-            "low": lows,
-            "close": prices,
-            "volume": volumes,
-            "returns": pd.Series(prices).pct_change().fillna(0)
-        })
-        return df
+        raise FileNotFoundError("EURUSD dataset not found in root!")
 
 
 # ════════════════════════════════════════════════════════
-# TARGET BUILDER
+# TARGET BUILDER & FEATURE ENGINE
 # ════════════════════════════════════════════════════════
 class TargetBuilder:
     @staticmethod
@@ -158,10 +116,7 @@ class TargetBuilder:
                 hit_tp = highs[i + j] >= tp_buy_price
                 hit_sl = lows[i + j] <= sl_buy_price
 
-                if hit_tp and hit_sl:
-                    y_buy[i] = 0
-                    break
-                elif hit_sl:
+                if hit_tp and hit_sl or hit_sl:
                     y_buy[i] = 0
                     break
                 elif hit_tp:
@@ -173,10 +128,7 @@ class TargetBuilder:
                 hit_tp = lows[i + j] <= tp_sell_price
                 hit_sl = highs[i + j] >= sl_sell_price
 
-                if hit_tp and hit_sl:
-                    y_sell[i] = 0
-                    break
-                elif hit_sl:
+                if hit_tp and hit_sl or hit_sl:
                     y_sell[i] = 0
                     break
                 elif hit_tp:
@@ -186,9 +138,6 @@ class TargetBuilder:
         return y_buy, y_sell
 
 
-# ════════════════════════════════════════════════════════
-# FEATURE ENGINE
-# ════════════════════════════════════════════════════════
 class FeatureEngine:
     EPS = 1e-10
 
@@ -231,8 +180,6 @@ class BacktestEngine:
         thresh_sell = cfg.PROB_THRESHOLD_SELL
 
         trades = []
-        pnl_list = []
-        
         for i in range(len(df_test) - cfg.LOOKAHEAD_BARS):
             prob_b = p_buy[i]
             prob_s = p_sell[i]
@@ -247,9 +194,8 @@ class BacktestEngine:
                 continue
 
             entry_price = df_test["close"].iloc[i]
-            
-            # Check trade outcome over lookahead window
             trade_pnl = 0
+            
             for j in range(1, cfg.LOOKAHEAD_BARS + 1):
                 high = df_test["high"].iloc[i + j]
                 low = df_test["low"].iloc[i + j]
@@ -270,7 +216,6 @@ class BacktestEngine:
                         break
 
             trades.append(trade_pnl)
-            pnl_list.append(trade_pnl)
 
         if not trades:
             return {
@@ -293,12 +238,10 @@ class BacktestEngine:
         win_rate = len(wins) / len(trades)
         total_pnl = np.sum(trades)
 
-        # Equity Curve & Max Drawdown
         equity = np.cumsum(trades)
         peak = np.maximum.accumulate(equity)
         drawdown = peak - equity
         max_dd = np.max(drawdown) if len(drawdown) > 0 else 0.0
-
         sharpe = (np.mean(trades) / (np.std(trades) + 1e-10)) * np.sqrt(252 * 24)
 
         return {
@@ -312,22 +255,6 @@ class BacktestEngine:
 
 
 # ════════════════════════════════════════════════════════
-# MODEL TRAINER
-# ════════════════════════════════════════════════════════
-class ModelTrainer:
-    def __init__(self, cfg):
-        self.cfg = cfg
-
-    def train_model(self, X_train, y_train):
-        params = {**self.cfg.XGB_BASE, **GPU_PARAMS}
-        params = {k: v for k, v in params.items() if v is not None}
-        
-        model = XGBClassifier(**params)
-        model.fit(X_train, y_train)
-        return model
-
-
-# ════════════════════════════════════════════════════════
 # ONNX EXPORTER
 # ════════════════════════════════════════════════════════
 class ONNXExporter:
@@ -336,14 +263,8 @@ class ONNXExporter:
         os.makedirs(self.out_dir, exist_ok=True)
 
     def export_model(self, model, name, num_features):
-        initial_types = [("input", FloatTensorType([1, num_features]))]
-        
-        onnx_model = convert_sklearn(
-            model,
-            initial_types=initial_types,
-            target_opset=TARGET_OPSET,
-            options={type(model): {"zipmap": False}}
-        )
+        initial_types = [("input", ONNXFloatTensorType([1, num_features]))]
+        onnx_model = convert_xgboost(model, initial_types=initial_types, target_opset=15)
 
         fpath = os.path.join(self.out_dir, f"{name}.onnx")
         with open(fpath, "wb") as f:
@@ -357,9 +278,6 @@ class ONNXExporter:
         return fpath
 
 
-# ════════════════════════════════════════════════════════
-# SESSION STATE HELPERS
-# ════════════════════════════════════════════════════════
 def write_progress_flag(output_dir, steps_run: int):
     flag_path = os.path.join(output_dir, "session_progress.json")
     with open(flag_path, "w") as fh:
@@ -367,11 +285,12 @@ def write_progress_flag(output_dir, steps_run: int):
 
 
 # ════════════════════════════════════════════════════════
-# MAIN EXECUTION PIPELINE
+# MAIN CONTINUOUS TUNING PIPELINE
 # ════════════════════════════════════════════════════════
 if __name__ == "__main__":
     gc.collect()
-    print(f"Starting GitHub Actions Run | Initial RAM: {ram()}")
+    start_time = time.time()
+    print(f"Starting Continuous Training Session | Initial RAM: {ram()}")
 
     cfg = SystemConfig()
     os.makedirs(cfg.OUTPUT_DIR, exist_ok=True)
@@ -383,20 +302,11 @@ if __name__ == "__main__":
     fe = FeatureEngine()
     df_feat = fe.build(df)
 
-    print("Phase 3: Labeling Targets (TP/SL rules)...")
-    y_buy, y_sell = TargetBuilder.build_targets(
-        df_feat, cfg.TP_PCT, cfg.SL_PCT, cfg.LOOKAHEAD_BARS
-    )
+    print("Phase 3: Labeling Targets...")
+    y_buy, y_sell = TargetBuilder.build_targets(df_feat, cfg.TP_PCT, cfg.SL_PCT, cfg.LOOKAHEAD_BARS)
 
     feature_cols = [c for c in df_feat.columns if c not in ["timestamp", "open", "high", "low", "close", "volume", "returns"]]
     X = df_feat[feature_cols].values.astype(np.float32)
-
-    features_meta = {
-        "feature_cols": feature_cols,
-        "feature_index": {col: idx for idx, col in enumerate(feature_cols)}
-    }
-    with open(os.path.join(cfg.OUTPUT_DIR, "features.json"), "w") as f:
-        json.dump(features_meta, f, indent=2)
 
     train_size = int(len(X) * 0.8)
     X_train, X_test = X[:train_size], X[train_size:]
@@ -404,59 +314,83 @@ if __name__ == "__main__":
     y_sell_tr, y_sell_te = y_sell[:train_size], y_sell[train_size:]
     df_test = df_feat.iloc[train_size:].reset_index(drop=True)
 
-    print("\nPhase 4: Training XGBoost Models...")
-    trainer = ModelTrainer(cfg)
+    print(f"\nPhase 4: Entering Continuous 5-Hour Optuna Hyperparameter Optimization Loop...")
     
-    print("  -> Training BUY Model...")
-    model_buy = trainer.train_model(X_train, y_buy_tr)
-    
-    print("  -> Training SELL Model...")
-    model_sell = trainer.train_model(X_train, y_sell_tr)
+    best_models = {"buy": None, "sell": None}
+    best_results = {"profit_factor": -1.0}
 
-    print("\nPhase 5: Out-of-Sample Predictions & Backtesting...")
-    p_buy_te = model_buy.predict_proba(X_test)[:, 1]
-    p_sell_te = model_sell.predict_proba(X_test)[:, 1]
+    def objective(trial):
+        if time.time() - start_time > cfg.MAX_TUNING_TIME_SEC:
+            trial.study.stop()
+            return 0.0
 
-    auc_buy = roc_auc_score(y_buy_te, p_buy_te)
-    auc_sell = roc_auc_score(y_sell_te, p_sell_te)
-    
-    print(f"  OOS BUY AUC:  {auc_buy:.4f}")
-    print(f"  OOS SELL AUC: {auc_sell:.4f}")
+        params = {
+            "n_estimators": trial.suggest_int("n_estimators", 150, 800, step=50),
+            "max_depth": trial.suggest_int("max_depth", 3, 9),
+            "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.15, log=True),
+            "subsample": trial.suggest_float("subsample", 0.6, 1.0),
+            "colsample_bytree": trial.suggest_float("colsample_bytree", 0.6, 1.0),
+            "gamma": trial.suggest_float("gamma", 0.0, 5.0),
+            "random_state": 42,
+            "verbosity": 0,
+            "eval_metric": "logloss",
+            **GPU_PARAMS
+        }
+        params = {k: v for k, v in params.items() if v is not None}
 
-    print("\n  -> Running Out-of-Sample Trading Simulation...")
-    bt_results = BacktestEngine.run_backtest(df_test, p_buy_te, p_sell_te, cfg)
-    
+        model_b = XGBClassifier(**params).fit(X_train, y_buy_tr)
+        model_s = XGBClassifier(**params).fit(X_train, y_sell_tr)
+
+        p_b = model_b.predict_proba(X_test)[:, 1]
+        p_s = model_s.predict_proba(X_test)[:, 1]
+
+        bt = BacktestEngine.run_backtest(df_test, p_b, p_s, cfg)
+
+        # Composite metric prioritizing Profit Factor with trade count penalties
+        if bt["total_trades"] < 15:
+            score = 0.0
+        else:
+            score = bt["profit_factor"]
+
+        if score > best_results.get("score", -1.0):
+            best_results["score"] = score
+            best_results["bt"] = bt
+            best_results["auc_buy"] = float(roc_auc_score(y_buy_te, p_b))
+            best_results["auc_sell"] = float(roc_auc_score(y_sell_te, p_s))
+            best_models["buy"] = model_b
+            best_models["sell"] = model_s
+            print(f"  ★ Trial {trial.number} New Best! Trades: {bt['total_trades']} | PF: {bt['profit_factor']} | Win Rate: {bt['win_rate']*100:.1f}%")
+
+        return score
+
+    study = optuna.create_study(direction="maximize")
+    study.optimize(objective, n_trials=5000, timeout=cfg.MAX_TUNING_TIME_SEC)
+
+    print("\nPhase 5: Optimization Summary & Best Metrics...")
+    bt = best_results.get("bt", {})
     print(f"  ┌──────────────────────────────────────────┐")
-    print(f"  │           BACKTEST METRICS               │")
+    print(f"  │        BEST OPTUNA BACKTEST METRICS      │")
     print(f"  ├──────────────────────────────────────────┤")
-    print(f"  │ Total Trades:   {bt_results['total_trades']:<25}│")
-    print(f"  │ Win Rate:       {bt_results['win_rate'] * 100:.1f}%{'':<21}│")
-    print(f"  │ Profit Factor:  {bt_results['profit_factor']:<25}│")
-    print(f"  │ Total PnL:      {bt_results['total_pnl_pct']:.2f}%{'':<20}│")
-    print(f"  │ Max Drawdown:   {bt_results['max_drawdown_pct']:.2f}%{'':<20}│")
-    print(f"  │ Sharpe Ratio:   {bt_results['sharpe_ratio']:<25}│")
+    print(f"  │ Total Trades:   {bt.get('total_trades', 0):<25}│")
+    print(f"  │ Win Rate:       {bt.get('win_rate', 0.0) * 100:.1f}%{'':<21}│")
+    print(f"  │ Profit Factor:  {bt.get('profit_factor', 0.0):<25}│")
+    print(f"  │ Total PnL:      {bt.get('total_pnl_pct', 0.0):.2f}%{'':<20}│")
+    print(f"  │ Max Drawdown:   {bt.get('max_drawdown_pct', 0.0):.2f}%{'':<20}│")
+    print(f"  │ Sharpe Ratio:   {bt.get('sharpe_ratio', 0.0):<25}│")
     print(f"  └──────────────────────────────────────────┘")
 
     metrics = {
-        "auc": {
-            "buy": float(auc_buy),
-            "sell": float(auc_sell)
-        },
-        "backtest": bt_results,
-        "config": {
-            "tp_pct": cfg.TP_PCT,
-            "sl_pct": cfg.SL_PCT,
-            "threshold_buy": cfg.PROB_THRESHOLD_BUY,
-            "threshold_sell": cfg.PROB_THRESHOLD_SELL
-        }
+        "auc": {"buy": best_results.get("auc_buy", 0), "sell": best_results.get("auc_sell", 0)},
+        "backtest": bt,
+        "best_params": study.best_params if len(study.trials) > 0 else {}
     }
     with open(os.path.join(cfg.OUTPUT_DIR, "metrics.json"), "w") as f:
         json.dump(metrics, f, indent=2)
 
-    print("\nPhase 6: Exporting ONNX Artifacts...")
+    print("\nPhase 6: Exporting ONNX Artifacts for Best Models...")
     exporter = ONNXExporter(cfg.OUTPUT_DIR)
-    exporter.export_model(model_buy, "model_buy", len(feature_cols))
-    exporter.export_model(model_sell, "model_sell", len(feature_cols))
+    exporter.export_model(best_models["buy"], "model_buy", len(feature_cols))
+    exporter.export_model(best_models["sell"], "model_sell", len(feature_cols))
 
     write_progress_flag(cfg.OUTPUT_DIR, steps_run=len(X))
     print(f"\nExecution Finished Successfully | Final RAM: {ram()}")

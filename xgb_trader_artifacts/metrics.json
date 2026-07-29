@@ -1,0 +1,22 @@
+{
+  "auc": {
+    "buy": 0.4332602213680813,
+    "sell": 0.6163504238998789
+  },
+  "backtest": {
+    "total_trades": 4,
+    "win_rate": 0.0,
+    "profit_factor": 0.0,
+    "total_pnl_pct": 0.0,
+    "max_drawdown_pct": 0.0,
+    "sharpe_ratio": 0.0
+  },
+  "best_params": {
+    "n_estimators": 800,
+    "max_depth": 6,
+    "learning_rate": 0.07673343915994117,
+    "subsample": 0.6704231242838621,
+    "colsample_bytree": 0.9549217455245944,
+    "gamma": 2.988746900964896
+  }
+}

@@ -1,0 +1,28 @@
+{
+  "feature_cols": [
+    "spread_close",
+    "close_sma_10",
+    "rsi_10",
+    "close_sma_20",
+    "rsi_20",
+    "close_sma_50",
+    "rsi_50",
+    "vol_10",
+    "vol_20",
+    "vol_60",
+    "atr_14"
+  ],
+  "feature_index": {
+    "spread_close": 0,
+    "close_sma_10": 1,
+    "rsi_10": 2,
+    "close_sma_20": 3,
+    "rsi_20": 4,
+    "close_sma_50": 5,
+    "rsi_50": 6,
+    "vol_10": 7,
+    "vol_20": 8,
+    "vol_60": 9,
+    "atr_14": 10
+  }
+}

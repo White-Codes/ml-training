@@ -20,10 +20,11 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.10'
+          cache: 'pip'
 
       - name: Install Libraries
         run: |
-          pip install xgboost shap optuna \
+          pip install xgboost optuna \
             scikit-learn pandas numpy \
             matplotlib seaborn scipy \
             joblib tqdm skl2onnx \
@@ -33,10 +34,10 @@ jobs:
       - name: Restore Relay Cache
         uses: actions/cache@v4
         with:
-          path: xgb_rl_artifacts/
-          key: rl-weights-latest
+          path: xgb_trader_artifacts/
+          key: trader-artifacts-latest
           restore-keys: |
-            rl-weights-
+            trader-artifacts-
 
       # ── Pull latest checkpoints committed to git ──
       - name: Pull Latest Artifacts from Git
@@ -55,8 +56,9 @@ jobs:
         run: |
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
-          git add -A xgb_rl_artifacts/ || true
-          git diff --staged --quiet || git commit -m "Auto-save checkpoint [skip ci]"
+          git pull origin main --rebase || true
+          git add -A xgb_trader_artifacts/ || true
+          git diff --staged --quiet || git commit -m "Auto-save model artifacts [skip ci]"
           git push origin main || true
 
       # ── Read session progress ──
@@ -65,8 +67,8 @@ jobs:
         if: always()
         run: |
           STEPS=0
-          if [ -f xgb_rl_artifacts/session_progress.json ]; then
-            STEPS=$(python3 -c "import json; print(json.load(open('xgb_rl_artifacts/session_progress.json')).get('steps_run', 0))")
+          if [ -f xgb_trader_artifacts/session_progress.json ]; then
+            STEPS=$(python3 -c "import json; print(json.load(open('xgb_trader_artifacts/session_progress.json')).get('steps_run', 0))")
           fi
           echo "steps_run=${STEPS}" >> "$GITHUB_OUTPUT"
           echo "Steps run this session: ${STEPS}"
